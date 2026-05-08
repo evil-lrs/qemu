@@ -28,7 +28,44 @@ quiet-command = $(quiet-@)$(call quiet-command-run,$1,$2,$3)
 
 UNCHECKED_GOALS := TAGS gtags cscope ctags dist \
     help check-help print-% \
-    docker docker-% lcitool-refresh vm-help vm-test vm-build-%
+    docker docker-% lcitool-refresh vm-help vm-test vm-build-% \
+    esp32-configure esp32-build esp32-clean
+.PHONY: esp32-configure esp32-build esp32-clean esp32-reconfigure
+
+BREW_PREFIX_LIBGCRYPT := $(shell brew --prefix libgcrypt)
+BREW_PREFIX_LIBGPG_ERROR := $(shell brew --prefix libgpg-error)
+BREW_PREFIX_GNUTLS := $(shell brew --prefix gnutls)
+NCPU := $(shell sysctl -n hw.ncpu)
+
+ESP32_PKG_CONFIG_PATH := $(BREW_PREFIX_LIBGCRYPT)/lib/pkgconfig:$(BREW_PREFIX_LIBGPG_ERROR)/lib/pkgconfig:$(BREW_PREFIX_GNUTLS)/lib/pkgconfig
+
+esp32-configure:
+	PKG_CONFIG_PATH="$(ESP32_PKG_CONFIG_PATH)" \
+	../configure \
+	  --target-list=xtensa-softmmu \
+	  --disable-gnutls --enable-gcrypt \
+	  --disable-gtk \
+	  --disable-sdl \
+	  --disable-cocoa \
+	  --disable-vnc \
+	  --disable-opengl \
+	  --disable-virglrenderer \
+	  --enable-debug \
+	  --disable-strip \
+	  --disable-werror
+
+esp32-build:
+	@if [ ! -f config-host.mak ]; then \
+		$(MAKE) esp32-configure; \
+	fi
+	$(MAKE) -j"$(NCPU)"
+
+esp32-reconfigure:
+	rm -f config-host.mak config.status
+	$(MAKE) esp32-configure
+
+esp32-clean:
+	$(MAKE) clean
 
 all:
 .PHONY: all clean distclean recurse-all dist msi FORCE

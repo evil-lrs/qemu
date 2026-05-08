@@ -34,7 +34,11 @@ typedef struct Esp32TimgTimerState {
     bool edge_int_en;
     bool level_int_en;
     bool alarm;
+    uint32_t logged_config_reg;
+    bool logged_config_valid;
     uint64_t alarm_val;
+    uint64_t logged_alarm_val;
+    bool logged_alarm_valid;
     uint64_t load_val;
     uint64_t count_base;
     uint64_t last_val;
@@ -94,6 +98,8 @@ typedef struct Esp32TimgState {
 
     bool rtc_cal_start;
     bool rtc_cal_ready;
+    bool rtc_cal_logged_start;
+    bool rtc_cal_logged_ready;
     Esp32TimgCalClkSel rtc_cal_clk_sel;
     uint32_t rtc_cal_max;
     uint32_t rtc_cal_value;

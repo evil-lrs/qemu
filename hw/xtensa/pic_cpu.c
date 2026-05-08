@@ -66,6 +66,7 @@ void check_interrupts(CPUXtensaState *env)
 static void xtensa_set_irq(void *opaque, int irq, int active)
 {
     CPUXtensaState *env = opaque;
+    CPUState *cs = env_cpu(env);
 
     if (irq >= env->config->ninterrupt) {
         qemu_log("%s: bad IRQ %d\n", __func__, irq);
@@ -78,6 +79,23 @@ static void xtensa_set_irq(void *opaque, int irq, int active)
             qatomic_and(&env->sregs[INTSET], ~irq_bit);
         }
 
+        if (irq == 12 || irq == 26) {
+            int minlevel = xtensa_get_cintlevel(env);
+            bool enabled = env->sregs[INTENABLE] & irq_bit;
+            bool deliverable = active && enabled &&
+                               env->config->interrupt[irq].level > minlevel;
+            qemu_log_mask(CPU_LOG_INT,
+                          "XTENSA_IRQ: cpu=%d irq=%d active=%d level=%u "
+                          "type=%d enabled=%d deliverable=%d cintlevel=%d "
+                          "intset=0x%08x intenable=0x%08x ps=0x%08x "
+                          "pc=0x%08x\n",
+                          cs->cpu_index, irq, active,
+                          env->config->interrupt[irq].level,
+                          env->config->interrupt[irq].inttype, enabled,
+                          deliverable, minlevel, env->sregs[INTSET],
+                          env->sregs[INTENABLE], env->sregs[PS], env->pc);
+        }
+
         check_interrupts(env);
     }
 }
@@ -86,8 +104,21 @@ static void xtensa_ccompare_cb(void *opaque)
 {
     XtensaCcompareTimer *ccompare = opaque;
     CPUXtensaState *env = ccompare->env;
+    CPUState *cs = env_cpu(env);
     unsigned i = ccompare - env->ccompare;
 
+    ccompare->cb_log_count++;
+    if (ccompare->cb_log_count <= 8 ||
+        (ccompare->cb_log_count % 1000) == 0) {
+        qemu_log_mask(CPU_LOG_INT,
+                      "XTENSA_CCOMPARE: cpu=%d timer=%u irq=%u fire count=%u "
+                      "ccount=0x%08x ccompare=0x%08x intset=0x%08x "
+                      "intenable=0x%08x pc=0x%08x\n",
+                      cs->cpu_index, i, env->config->timerint[i],
+                      ccompare->cb_log_count, env->sregs[CCOUNT],
+                      env->sregs[CCOMPARE + i], env->sregs[INTSET],
+                      env->sregs[INTENABLE], env->pc);
+    }
     qemu_set_irq(env->irq_inputs[env->config->timerint[i]], 1);
 }
 

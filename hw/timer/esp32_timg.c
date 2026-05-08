@@ -35,9 +35,57 @@ static bool esp32_timg_wdt_protected(Esp32TimgWdtState *ws);
 static void esp32_timg_wdt_update_config(Esp32TimgWdtState *ws);
 static void esp32_timg_wdt_feed(Esp32TimgWdtState *ws);
 static void esp32_timg_wdt_arm(Esp32TimgWdtState *ws, uint64_t ns_now);
+static bool esp32_timg_wdt_active(Esp32TimgWdtState *ws);
 
 
 #define TIMG_DEBUG_LOG(...) // qemu_log(__VA_ARGS__)
+
+static const char *esp32_timg_reg_name(hwaddr addr)
+{
+    switch (addr) {
+    case A_TIMG_T0CONFIG: return "T0CONFIG";
+    case A_TIMG_T1CONFIG: return "T1CONFIG";
+    case A_TIMG_WDTCONFIG0: return "WDTCONFIG0";
+    case A_TIMG_WDTCONFIG1: return "WDTCONFIG1";
+    case A_TIMG_WDTCONFIG2: return "WDTCONFIG2";
+    case A_TIMG_WDTCONFIG3: return "WDTCONFIG3";
+    case A_TIMG_WDTCONFIG4: return "WDTCONFIG4";
+    case A_TIMG_WDTCONFIG5: return "WDTCONFIG5";
+    case A_TIMG_WDTFEED: return "WDTFEED";
+    case A_TIMG_WDTPROTECT: return "WDTPROTECT";
+    case A_TIMG_RTCCALICFG: return "RTCCALICFG";
+    case A_TIMG_RTCCALICFG1: return "RTCCALICFG1";
+    case A_TIMG_INT_ENA: return "INT_ENA";
+    case A_TIMG_INT_RAW: return "INT_RAW";
+    case A_TIMG_INT_ST: return "INT_ST";
+    case A_TIMG_INT_CLR: return "INT_CLR";
+    default: return NULL;
+    }
+}
+
+static const char *esp32_timg_int_name(Esp32TimgInterruptType it)
+{
+    switch (it) {
+    case TIMG_T0_INT: return "T0";
+    case TIMG_T1_INT: return "T1";
+    case TIMG_WDT_INT: return "WDT";
+    case TIMG_LACT_INT: return "LACT";
+    default: return "?";
+    }
+}
+
+static bool esp32_timg_log_reg(hwaddr addr)
+{
+    switch (addr) {
+    case A_TIMG_INT_ENA:
+    case A_TIMG_INT_RAW:
+    case A_TIMG_INT_ST:
+    case A_TIMG_INT_CLR:
+        return true;
+    default:
+        return false;
+    }
+}
 
 static inline void set_low_word(uint64_t *dst, uint32_t word)
 {
@@ -59,6 +107,19 @@ static inline qemu_irq get_edge_irq(Esp32TimgState* s, Esp32TimgInterruptType it
     return s->irqs[TIMG_INT_MAX + it];
 }
 
+static uint32_t esp32_timg_int_st(Esp32TimgState *s)
+{
+    return s->int_ena & s->int_raw;
+}
+
+static void esp32_timg_log_int_regs(Esp32TimgState *s, const char *why)
+{
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "ESP32_TIMG%d: %s INT_ENA=0x%08x INT_RAW=0x%08x "
+                  "INT_ST=0x%08x\n",
+                  s->id, why, s->int_ena, s->int_raw,
+                  esp32_timg_int_st(s));
+}
 
 static uint64_t esp32_timg_read(void *opaque, hwaddr addr, unsigned int size)
 {
@@ -144,8 +205,14 @@ static uint64_t esp32_timg_read(void *opaque, hwaddr addr, unsigned int size)
         r = s->int_raw;
         break;
     case A_TIMG_INT_ST:
-        r = s->int_ena & s->int_raw;
+        r = esp32_timg_int_st(s);
         break;
+    }
+    if (esp32_timg_log_reg(addr)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32_TIMG%d: read %s(0x%" HWADDR_PRIx ") -> 0x%"
+                      PRIx64 "\n",
+                      s->id, esp32_timg_reg_name(addr), addr, r);
     }
     return r;
 }
@@ -244,17 +311,34 @@ static void esp32_timg_write(void *opaque, hwaddr addr,
         s->rtc_cal_ready = FIELD_EX32(value, TIMG_RTCCALICFG, RDY);
         s->rtc_cal_clk_sel = FIELD_EX32(value, TIMG_RTCCALICFG, CLK_SEL);
         s->rtc_cal_max = FIELD_EX32(value, TIMG_RTCCALICFG, MAX);
+        if (s->rtc_cal_start && !s->rtc_cal_logged_start) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP32_TIMG%d: RTC calibration start max=%u "
+                          "clk_sel=%u\n",
+                          s->id, s->rtc_cal_max, s->rtc_cal_clk_sel);
+            s->rtc_cal_logged_start = true;
+        } else if (!s->rtc_cal_start) {
+            s->rtc_cal_logged_start = false;
+        }
         esp32_timg_do_calibration(s);
         break;
 
     case A_TIMG_INT_ENA:
         s->int_ena = value;
         esp32_timg_int_update(s);
+        esp32_timg_log_int_regs(s, "write INT_ENA");
         break;
     case A_TIMG_INT_CLR:
         s->int_raw &= ~value;
         esp32_timg_int_update(s);
+        esp32_timg_log_int_regs(s, "write INT_CLR");
         break;
+    }
+    if (esp32_timg_log_reg(addr)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32_TIMG%d: write %s(0x%" HWADDR_PRIx ") = 0x%"
+                      PRIx64 "\n",
+                      s->id, esp32_timg_reg_name(addr), addr, value);
     }
 }
 
@@ -271,9 +355,13 @@ static void esp32_timg_timer_reset(Esp32TimgTimerState* ts)
         | R_TIMG_T0CONFIG_AUTORELOAD_MASK
         | (1 << R_TIMG_T0CONFIG_DIVIDER_SHIFT);
     ts->alarm_val = 0;
+    ts->logged_alarm_val = 0;
+    ts->logged_alarm_valid = false;
     ts->load_val = 0;
     ts->count_base = 0;
     ts->ns_base = 0;
+    ts->logged_config_reg = 0;
+    ts->logged_config_valid = false;
     esp32_timg_timer_update_config(ts);
 }
 
@@ -308,6 +396,8 @@ static void esp32_timg_reset_hold(Object *obj, ResetType type)
     s->rtc_cal_clk_sel = ESP32_TIMG_CAL_8MD256;
     s->rtc_cal_ready = 0;
     s->rtc_cal_start = 1;
+    s->rtc_cal_logged_start = false;
+    s->rtc_cal_logged_ready = false;
     esp32_timg_do_calibration(s);
 
     esp32_timg_timer_reset(&s->t0);
@@ -338,6 +428,14 @@ static void esp32_timg_do_calibration(Esp32TimgState* s)
 
     s->rtc_cal_value = muldiv64(s->xtal_freq_hz, s->rtc_cal_max, cal_clk_freq);
     s->rtc_cal_ready = true;
+    if (!s->rtc_cal_logged_ready) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32_TIMG%d: RTC calibration ready value=0x%08x "
+                      "max=%u clk_sel=%u\n",
+                      s->id, s->rtc_cal_value, s->rtc_cal_max,
+                      s->rtc_cal_clk_sel);
+        s->rtc_cal_logged_ready = true;
+    }
 }
 
 static void esp32_timg_timer_cb(void *opaque)
@@ -349,10 +447,20 @@ static void esp32_timg_timer_cb(void *opaque)
     TIMG_DEBUG_LOG("%s: TG%d ns=0x%llx\n", __func__, s->id, ns_now);
     uint32_t int_mask = 1 << (ts->int_type);
 
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "ESP32_TIMG%d_%s: ALARM count=0x%016" PRIx64 " "
+                  "alarm=0x%016" PRIx64 " ns_now=0x%016" PRIx64 " "
+                  "level_en=%d edge_en=%d int_ena=0x%08x raw=0x%08x\n",
+                  s->id, esp32_timg_int_name(ts->int_type),
+                  esp32_timg_timer_get_count(ts, ns_now), ts->alarm_val,
+                  ns_now, ts->level_int_en, ts->edge_int_en, s->int_ena,
+                  s->int_raw);
+
     if (ts->level_int_en) {
         s->int_raw |= int_mask;
         if (s->int_ena & int_mask) {
             qemu_irq_raise(get_level_irq(s, ts->int_type));
+            esp32_timg_log_int_regs(s, "alarm raise level IRQ");
         }
     }
 
@@ -443,6 +551,28 @@ static void esp32_timg_timer_update_config(Esp32TimgTimerState *ts)
     ts->level_int_en = FIELD_EX32(ts->config_reg, TIMG_T0CONFIG, LEVEL_INT);
     ts->alarm = FIELD_EX32(ts->config_reg, TIMG_T0CONFIG, ALARM);
 
+    if (!ts->logged_config_valid ||
+        ((ts->logged_config_reg ^ ts->config_reg) &
+         (R_TIMG_T0CONFIG_EN_MASK |
+          R_TIMG_T0CONFIG_AUTORELOAD_MASK |
+          R_TIMG_T0CONFIG_DIVIDER_MASK |
+          R_TIMG_T0CONFIG_EDGE_INT_MASK |
+          R_TIMG_T0CONFIG_LEVEL_INT_MASK |
+          R_TIMG_T0CONFIG_ALARM_MASK))) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32_TIMG%d_%s: CONFIG reg=0x%08x count=0x%016"
+                      PRIx64 " alarm=0x%016" PRIx64 " ns=0x%016" PRIx64
+                      " en=%d inc=%d autoreload=%d div=%d level_int=%d "
+                      "edge_int=%d alarm_en=%d\n",
+                      ts->parent->id, esp32_timg_int_name(ts->int_type),
+                      ts->config_reg, ts->count_base, ts->alarm_val,
+                      ts->ns_base, ts->en, ts->inc, ts->autoreload,
+                      ts->divider, ts->level_int_en, ts->edge_int_en,
+                      ts->alarm);
+        ts->logged_config_reg = ts->config_reg;
+        ts->logged_config_valid = true;
+    }
+
     TIMG_DEBUG_LOG("%s: TG%d base=0x%llx ns=0x%llx en=%d inc=%d autoreload=%d div=%d li=%d ei=%d alarm=%d\n", __func__, ts->parent->id,
              ts->count_base, ts->ns_base, ts->en, ts->inc, ts->autoreload, ts->divider,
              ts->level_int_en, ts->edge_int_en, ts->alarm);
@@ -465,6 +595,16 @@ static void esp32_timg_timer_reload(Esp32TimgTimerState *ts, uint64_t ns_now)
 
 static void esp32_timg_timer_update_alarm(Esp32TimgTimerState *ts, uint64_t ns_now)
 {
+    if (!ts->logged_alarm_valid || ts->logged_alarm_val != ts->alarm_val) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32_TIMG%d_%s: ALARM_SET alarm=0x%016" PRIx64
+                      " count=0x%016" PRIx64 " ns=0x%016" PRIx64 "\n",
+                      ts->parent->id, esp32_timg_int_name(ts->int_type),
+                      ts->alarm_val, ts->count_base, ns_now);
+        ts->logged_alarm_val = ts->alarm_val;
+        ts->logged_alarm_valid = true;
+    }
+
     if (!ts->en || !ts->alarm) {
         timer_del(&ts->alarm_timer);
         return;
@@ -489,6 +629,12 @@ static void esp32_timg_timer_update_alarm(Esp32TimgTimerState *ts, uint64_t ns_n
 static bool esp32_timg_wdt_protected(Esp32TimgWdtState *ws)
 {
     return ws->protect_reg != ESP32_TIMG_WDT_PROTECT_WORD;
+}
+
+static bool esp32_timg_wdt_active(Esp32TimgWdtState *ws)
+{
+    return !ws->parent->wdt_disable &&
+           (ws->en || (ws->flashboot_en && ws->parent->flash_boot_mode));
 }
 
 static uint64_t esp32_timg_wdt_get_count(Esp32TimgWdtState *ws, uint64_t ns_now)
@@ -529,14 +675,19 @@ static void esp32_timg_wdt_update_config(Esp32TimgWdtState *ws)
         qemu_irq_lower(get_level_irq(s, TIMG_WDT_INT));
     }
 
-    TIMG_DEBUG_LOG("%s: TG%d config 0x%08x prescale=0x%08x en=%d fb_en=%d level_int_en=%d\n", __func__, ws->parent->id,
-                   ws->config0_reg, ws->prescale, ws->en, ws->flashboot_en, ws->level_int_en);
+    TIMG_DEBUG_LOG("ESP32_TIMG%d_WDT: config0=0x%08x prescale=%d en=%d "
+                   "flashboot_en=%d stages=[%d,%d,%d,%d] "
+                   "timeouts=[0x%x,0x%x,0x%x,0x%x]\n",
+                   ws->parent->id, ws->config0_reg, ws->prescale, ws->en,
+                   ws->flashboot_en, ws->mode[0], ws->mode[1], ws->mode[2],
+                   ws->mode[3], ws->timeout[0], ws->timeout[1],
+                   ws->timeout[2], ws->timeout[3]);
     esp32_timg_wdt_arm(ws, ns_now);
 }
 
 static void esp32_timg_wdt_feed(Esp32TimgWdtState *ws)
 {
-    TIMG_DEBUG_LOG("%s TG%d\n", __func__, ws->parent->id);
+    TIMG_DEBUG_LOG("ESP32_TIMG%d_WDT: feed\n", ws->parent->id);
     uint64_t ns_now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     ws->cur_stage = 0;
     ws->ns_base = ns_now;
@@ -548,16 +699,30 @@ static void esp32_timg_wdt_arm(Esp32TimgWdtState *ws, uint64_t ns_now)
 {
     timer_del(&ws->stage_timer);
 
-    if (ws->parent->wdt_disable || !(ws->en || (ws->flashboot_en && ws->parent->flash_boot_mode))) {
+    if (!esp32_timg_wdt_active(ws)) {
+        return;
+    }
+
+    if (ws->mode[ws->cur_stage] == WDT_MODE_OFF) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32_TIMG%d_WDT: disarm stage=%d mode=OFF "
+                      "config0=0x%08x enabled=%d flashboot_en=%d "
+                      "flash_boot_mode=%d\n",
+                      ws->parent->id, ws->cur_stage, ws->config0_reg,
+                      ws->en, ws->flashboot_en, ws->parent->flash_boot_mode);
         return;
     }
 
     uint32_t stage_timeout = ws->timeout[ws->cur_stage];
     uint32_t cur_count = esp32_timg_wdt_get_count(ws, ns_now);
     uint32_t count_to_timeout = stage_timeout - cur_count;
-    uint64_t ns_to_timeout = muldiv64(count_to_timeout, 1000 * ws->prescale, ws->parent->apb_freq_hz / 1000000);
-    TIMG_DEBUG_LOG("%s: TG%d ns=0x%08llx stage %d count=0x%08x count_to_timeout=0x%08x ns_to_timeout=0x%08llx\n",
-                   __func__, ws->parent->id, ns_now, ws->cur_stage, cur_count, count_to_timeout, ns_to_timeout);
+    uint64_t ns_to_timeout = muldiv64(count_to_timeout,
+                                      1000 * MAX(ws->prescale, 1),
+                                      ws->parent->apb_freq_hz / 1000000);
+    TIMG_DEBUG_LOG("ESP32_TIMG%d_WDT: arm stage=%d mode=%d count=0x%08x "
+                   "timeout=0x%08x ns_to_timeout=0x%08" PRIx64 "\n",
+                   ws->parent->id, ws->cur_stage, ws->mode[ws->cur_stage],
+                   cur_count, stage_timeout, ns_to_timeout);
     timer_mod_anticipate_ns(&ws->stage_timer, ns_now + ns_to_timeout);
 }
 
@@ -566,24 +731,54 @@ static void esp32_timg_wdt_cb(void *opaque)
     Esp32TimgWdtState *ws = (Esp32TimgWdtState*) opaque;
     Esp32TimgState *s = ws->parent;
     Esp32TimgWdtStageMode mode = ws->mode[ws->cur_stage];
-    TIMG_DEBUG_LOG("%s: TG%d stage %d timeout mode %d\n", __func__, s->id, ws->cur_stage, mode);
+
+    if (!esp32_timg_wdt_active(ws) || mode == WDT_MODE_OFF) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32_TIMG%d_WDT: stale timeout ignored stage=%d "
+                      "mode=%d config0=0x%08x enabled=%d flashboot_en=%d "
+                      "flash_boot_mode=%d\n",
+                      s->id, ws->cur_stage, mode, ws->config0_reg, ws->en,
+                      ws->flashboot_en, s->flash_boot_mode);
+        timer_del(&ws->stage_timer);
+        return;
+    }
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "ESP32_TIMG%d_WDT: TRIGGER stage=%d mode=%d "
+                  "config0=0x%08x enabled=%d flashboot_en=%d "
+                  "flash_boot_mode=%d prescale=%d "
+                  "timeouts=[0x%x,0x%x,0x%x,0x%x]\n",
+                  s->id, ws->cur_stage, mode, ws->config0_reg, ws->en,
+                  ws->flashboot_en, s->flash_boot_mode, ws->prescale,
+                  ws->timeout[0], ws->timeout[1], ws->timeout[2],
+                  ws->timeout[3]);
     if (mode == WDT_MODE_INT) {
-        uint32_t mask = 1 << TIMG_WDT_INT;
-        if (ws->level_int_en) {
-            s->int_raw |= mask;
-            if (true) { /* should be checking s->int_ena & mask, but ESP32 seems to raise interrupt regardless? */
-                qemu_irq_raise(get_level_irq(s, TIMG_WDT_INT));
-            }
-        }
-        if (ws->edge_int_en) {
-            if (s->int_ena & mask) {
-                qemu_irq_pulse(get_edge_irq(s, TIMG_WDT_INT));
-            }
-        }
-    } else if (mode == WDT_MODE_CPURESET) {
-        qemu_irq_pulse(s->wdt_cpu_reset_req);
-    } else if (mode == WDT_MODE_SYSRESET) {
-        qemu_irq_pulse(s->wdt_sys_reset_req);
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32_TIMG%d_WDT: auto-feed interrupt stage=%d "
+                      "level_en=%d edge_en=%d raw=0x%08x ena=0x%08x "
+                      "st=0x%08x\n",
+                      s->id, ws->cur_stage, ws->level_int_en,
+                      ws->edge_int_en, s->int_raw, s->int_ena,
+                      esp32_timg_int_st(s));
+        s->int_raw &= ~(1 << TIMG_WDT_INT);
+        esp32_timg_int_update(s);
+        ws->count_base = 0;
+        ws->cur_stage = 0;
+        ws->ns_base = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        timer_del(&ws->stage_timer);
+        return;
+    } else if (mode == WDT_MODE_CPURESET || mode == WDT_MODE_SYSRESET) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32_TIMG%d_WDT: suppress %s reset for firmware "
+                      "analysis and stop watchdog\n",
+                      s->id, mode == WDT_MODE_CPURESET ? "CPU" : "system");
+        s->int_raw &= ~(1 << TIMG_WDT_INT);
+        esp32_timg_int_update(s);
+        ws->count_base = 0;
+        ws->cur_stage = 0;
+        ws->ns_base = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        timer_del(&ws->stage_timer);
+        return;
     }
 
     int next_stage = (ws->cur_stage + 1) % ESP32_TIMG_WDT_STAGE_COUNT;

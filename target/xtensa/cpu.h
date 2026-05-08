@@ -346,6 +346,9 @@ typedef struct XtensaGdbRegmap {
 typedef struct XtensaCcompareTimer {
     CPUXtensaState *env;
     QEMUTimer *timer;
+    uint32_t cb_log_count;
+    uint32_t update_log_count;
+    uint32_t late_log_count;
 } XtensaCcompareTimer;
 
 typedef struct XtensaMemory {

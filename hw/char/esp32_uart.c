@@ -135,7 +135,9 @@ static void uart_write(void *opaque, hwaddr addr,
         if (fifo8_num_free(&s->tx_fifo) == 0) {
             error_report("esp_uart: write to UART FIFO while it is full");
         } else {
-            fifo8_push(&s->tx_fifo, (uint8_t) (value & 0xff));
+            uint8_t ch = (uint8_t) (value & 0xff);
+            fprintf(stderr, "esp32_uart: write to FIFO: 0x%02x '%c'\n", ch, isprint(ch) ? ch : '.');
+            fifo8_push(&s->tx_fifo, ch);
             uart_transmit(NULL, G_IO_OUT, s);
         }
         break;

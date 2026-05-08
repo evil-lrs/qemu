@@ -43,11 +43,80 @@ enum {
 
 static void esp32_spi_do_command(Esp32SpiState* state, uint32_t cmd_reg);
 
+static bool esp32_spi_debug(Esp32SpiState *s)
+{
+    return s->id == 2 || s->id == 3;
+}
+
+static const char *esp32_spi_reg_name(hwaddr addr)
+{
+    switch (addr) {
+    case A_SPI_CMD: return "CMD";
+    case A_SPI_ADDR: return "ADDR";
+    case A_SPI_CTRL: return "CTRL";
+    case A_SPI_STATUS: return "STATUS";
+    case A_SPI_CTRL1: return "CTRL1";
+    case A_SPI_CTRL2: return "CTRL2";
+    case A_SPI_USER: return "USER";
+    case A_SPI_USER1: return "USER1";
+    case A_SPI_USER2: return "USER2";
+    case A_SPI_MOSI_DLEN: return "MOSI_DLEN";
+    case A_SPI_MISO_DLEN: return "MISO_DLEN";
+    case A_SPI_PIN: return "PIN";
+    case A_SPI_SLAVE: return "SLAVE";
+    case A_SPI_EXT0: return "EXT0";
+    case A_SPI_EXT1: return "EXT1";
+    case A_SPI_EXT2: return "EXT2";
+    case A_SPI_EXT3: return "EXT3";
+    default:
+        if (addr >= A_SPI_W0 &&
+            addr <= A_SPI_W0 + (ESP32_SPI_BUF_WORDS - 1) * sizeof(uint32_t)) {
+            return "Wn";
+        }
+        return NULL;
+    }
+}
+
+static void esp32_spi_append_phase(GString *str, const void *buf,
+                                   int tx_bytes, int rx_bytes)
+{
+    const uint8_t *bytes = buf;
+    int count = MAX(tx_bytes, rx_bytes);
+
+    for (int i = 0; i < count; ++i) {
+        uint8_t byte = 0;
+
+        if (bytes && i < tx_bytes) {
+            byte = bytes[i];
+        }
+        g_string_append_printf(str, "%s%02x", str->len ? " " : "", byte);
+    }
+}
+
+static void esp32_spi_append_rx_phase(GString *str, const void *buf,
+                                      int tx_bytes, int rx_bytes)
+{
+    const uint8_t *bytes = buf;
+    int count = MAX(tx_bytes, rx_bytes);
+
+    for (int i = 0; i < count; ++i) {
+        uint8_t byte = 0;
+
+        if (bytes && i < rx_bytes) {
+            byte = bytes[i];
+        }
+        g_string_append_printf(str, "%s%02x", str->len ? " " : "", byte);
+    }
+}
+
 static uint64_t esp32_spi_read(void *opaque, hwaddr addr, unsigned int size)
 {
     Esp32SpiState *s = ESP32_SPI(opaque);
     uint64_t r = 0;
     switch (addr) {
+    case A_SPI_CMD:
+        r = s->cmd_reg;
+        break;
     case A_SPI_ADDR:
         r = s->addr_reg;
         break;
@@ -90,6 +159,23 @@ static uint64_t esp32_spi_read(void *opaque, hwaddr addr, unsigned int size)
     case A_SPI_SLAVE:
         r = BIT(R_SPI_SLAVE_TRANS_DONE_SHIFT) | BIT(R_SPI_SLAVE_TRANS_INTEN_SHIFT);
         break;
+    default:
+        if (esp32_spi_debug(s)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP32_SPI%d: read unknown offset=0x%" HWADDR_PRIx
+                          " size=%u\n", s->id, addr, size);
+        }
+        break;
+    }
+    if (esp32_spi_debug(s)) {
+        const char *name = esp32_spi_reg_name(addr);
+
+        if (name) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP32_SPI%d: read %s(0x%" HWADDR_PRIx
+                          ") -> 0x%" PRIx64 "\n",
+                          s->id, name, addr, r);
+        }
     }
     return r;
 }
@@ -99,9 +185,18 @@ static void esp32_spi_write(void *opaque, hwaddr addr,
 {
     Esp32SpiState *s = ESP32_SPI(opaque);
     switch (addr) {
-    case A_SPI_W0 ... A_SPI_W0 + (ESP32_SPI_BUF_WORDS - 1) * sizeof(uint32_t):
-        s->data_reg[(addr - A_SPI_W0) / sizeof(uint32_t)] = value;
+    case A_SPI_W0 ... A_SPI_W0 + (ESP32_SPI_BUF_WORDS - 1) * sizeof(uint32_t): {
+        int idx = (addr - A_SPI_W0) / sizeof(uint32_t);
+        s->data_reg[idx] = value;
+        if (esp32_spi_debug(s) && idx == 0) {
+            uint8_t bytes[4];
+            memcpy(bytes, &s->data_reg[0], 4);
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP32_SPI%d: W0 mem=[%02x %02x %02x %02x]\n",
+                          s->id, bytes[0], bytes[1], bytes[2], bytes[3]);
+        }
         break;
+    }
     case A_SPI_ADDR:
         s->addr_reg = value;
         break;
@@ -136,8 +231,28 @@ static void esp32_spi_write(void *opaque, hwaddr addr,
         s->pin_reg = value;
         break;
     case A_SPI_CMD:
+        fprintf(stderr, "ESP32_SPI%d: CMD write 0x%08x\n", s->id, (uint32_t)value);
+        s->cmd_reg = value;
         esp32_spi_do_command(s, value);
         break;
+    default:
+        if (esp32_spi_debug(s)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP32_SPI%d: write unknown offset=0x%" HWADDR_PRIx
+                          " value=0x%" PRIx64 " size=%u\n",
+                          s->id, addr, value, size);
+        }
+        break;
+    }
+    if (esp32_spi_debug(s)) {
+        const char *name = esp32_spi_reg_name(addr);
+
+        if (name) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP32_SPI%d: write %s(0x%" HWADDR_PRIx
+                          ") = 0x%" PRIx64 "\n",
+                          s->id, name, addr, value);
+        }
     }
 }
 
@@ -151,18 +266,39 @@ typedef struct Esp32SpiTransaction {
     uint32_t* data;
 } Esp32SpiTransaction;
 
-static void esp32_spi_txrx_buffer(Esp32SpiState *s, void *buf, int tx_bytes, int rx_bytes)
+static void esp32_spi_txrx_buffer(Esp32SpiState *s, const char *phase, void *buf, int tx_bytes, int rx_bytes)
 {
     int bytes = MAX(tx_bytes, rx_bytes);
     uint8_t *c_buf = (uint8_t*) buf;
+
+    if (esp32_spi_debug(s)) {
+        uint32_t first_word = 0;
+        if (buf && bytes >= 4) {
+            memcpy(&first_word, buf, 4);
+        } else if (buf && bytes > 0) {
+            memcpy(&first_word, buf, bytes);
+        }
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32_SPI%d: %s start len=%d tx=%d rx=%d word0=0x%08x\n",
+                      s->id, phase, bytes, tx_bytes, rx_bytes, first_word);
+    }
+
     for (int i = 0; i < bytes; ++i) {
         uint8_t byte = 0;
-        if (byte < tx_bytes) {
-            memcpy(&byte, c_buf + i, 1);
+        if (c_buf && i < tx_bytes) {
+            byte = c_buf[i];
         }
+
         uint32_t res = ssi_transfer(s->spi, byte);
-        if (byte < rx_bytes) {
-            memcpy(c_buf + i, &res, 1);
+
+        if (esp32_spi_debug(s) && (i < 8 || i == bytes - 1)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP32_SPI%d:   %s[%d] tx=0x%02x rx=0x%02x\n",
+                          s->id, phase, i, byte, res);
+        }
+
+        if (c_buf && i < rx_bytes) {
+            c_buf[i] = res;
         }
     }
 }
@@ -170,17 +306,77 @@ static void esp32_spi_txrx_buffer(Esp32SpiState *s, void *buf, int tx_bytes, int
 static void esp32_spi_cs_set(Esp32SpiState *s, int value)
 {
     for (int i = 0; i < ESP32_SPI_CS_COUNT; ++i) {
-        qemu_set_irq(s->cs_gpio[i], ((s->pin_reg & (1 << i)) == 0) ? value : 1);
+        int level;
+
+        if (s->external_cs_valid[i]) {
+            level = s->external_cs_level[i];
+        } else {
+            level = ((s->pin_reg & (1 << i)) == 0) ? value : 1;
+        }
+        qemu_set_irq(s->cs_gpio[i], level);
     }
+}
+
+static void esp32_spi_external_cs(void *opaque, int n, int level)
+{
+    Esp32SpiState *s = ESP32_SPI(opaque);
+
+    if (n < 0 || n >= ESP32_SPI_CS_COUNT) {
+        return;
+    }
+
+    s->external_cs_valid[n] = true;
+    s->external_cs_level[n] = level ? 1 : 0;
+
+    if (esp32_spi_debug(s)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32_SPI%d: external CS%d %s\n",
+                      s->id, n, level ? "high" : "low");
+    }
+
+    /* Forward the GPIO level to the SSI device CS line */
+    qemu_set_irq(s->cs_gpio[n], s->external_cs_level[n]);
 }
 
 static void esp32_spi_transaction(Esp32SpiState *s, Esp32SpiTransaction *t)
 {
+    GString *mosi = NULL;
+    GString *miso = NULL;
+
+    if (esp32_spi_debug(s)) {
+        mosi = g_string_new(NULL);
+        esp32_spi_append_phase(mosi, &t->cmd, t->cmd_bytes, 0);
+        esp32_spi_append_phase(mosi, &t->addr, t->addr_bytes, 0);
+        esp32_spi_append_phase(mosi, t->data, t->data_tx_bytes,
+                               t->data_rx_bytes);
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32_SPI%d: transaction mosi_len=%d miso_len=%d "
+                      "MOSI=[%s]\n",
+                      s->id,
+                      t->cmd_bytes + t->addr_bytes +
+                      MAX(t->data_tx_bytes, t->data_rx_bytes),
+                      t->data_rx_bytes,
+                      mosi->str);
+        g_string_free(mosi, true);
+    }
+
     esp32_spi_cs_set(s, 0);
-    esp32_spi_txrx_buffer(s, &t->cmd, t->cmd_bytes, 0);
-    esp32_spi_txrx_buffer(s, &t->addr, t->addr_bytes, 0);
-    esp32_spi_txrx_buffer(s, t->data, t->data_tx_bytes, t->data_rx_bytes);
+    esp32_spi_txrx_buffer(s, "cmd", &t->cmd, t->cmd_bytes, 0);
+    esp32_spi_txrx_buffer(s, "addr", &t->addr, t->addr_bytes, 0);
+    esp32_spi_txrx_buffer(s, "data", t->data, t->data_tx_bytes, t->data_rx_bytes);
     esp32_spi_cs_set(s, 1);
+
+    if (esp32_spi_debug(s)) {
+        miso = g_string_new(NULL);
+        esp32_spi_append_rx_phase(miso, &t->cmd, t->cmd_bytes, 0);
+        esp32_spi_append_rx_phase(miso, &t->addr, t->addr_bytes, 0);
+        esp32_spi_append_rx_phase(miso, t->data, t->data_tx_bytes,
+                                  t->data_rx_bytes);
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32_SPI%d: transaction MISO=[%s]\n",
+                      s->id, miso->str);
+        g_string_free(miso, true);
+    }
 }
 
 /* Convert one of the hardware "bitlen" registers to a byte count */
@@ -200,39 +396,49 @@ static void maybe_encrypt_data(Esp32SpiState *s)
 static void esp32_spi_do_command(Esp32SpiState* s, uint32_t cmd_reg)
 {
     Esp32SpiTransaction t = {
-        .cmd_bytes = 1
+        .cmd_bytes = 0,
+        .addr_bytes = 0,
+        .data_tx_bytes = 0,
+        .data_rx_bytes = 0,
+        .data = NULL
     };
     switch (cmd_reg) {
     case R_SPI_CMD_READ_MASK:
         t.cmd = CMD_READ;
+        t.cmd_bytes = 1;
         t.addr_bytes = bitlen_to_bytes(FIELD_EX32(s->user1_reg, SPI_USER1, ADDR_BITLEN));
-        t.addr = bswap32(s->addr_reg) >> (32 - t.addr_bytes * 8);
+        t.addr = s->addr_reg;
         t.data = &s->data_reg[0];
         t.data_rx_bytes = bitlen_to_bytes(s->miso_dlen_reg);
         break;
 
     case R_SPI_CMD_WREN_MASK:
         t.cmd = CMD_WREN;
+        t.cmd_bytes = 1;
         break;
 
     case R_SPI_CMD_WRDI_MASK:
         t.cmd = CMD_WRDI;
+        t.cmd_bytes = 1;
         break;
 
     case R_SPI_CMD_RDID_MASK:
         t.cmd = CMD_RDID;
+        t.cmd_bytes = 1;
         t.data = &s->data_reg[0];
         t.data_rx_bytes = 3;
         break;
 
     case R_SPI_CMD_RDSR_MASK:
         t.cmd = CMD_RDSR;
+        t.cmd_bytes = 1;
         t.data = &s->status_reg;
         t.data_rx_bytes = 1;
         break;
 
     case R_SPI_CMD_WRSR_MASK:
         t.cmd = CMD_WRSR;
+        t.cmd_bytes = 1;
         t.data = &s->status_reg;
         t.data_tx_bytes = 1;
         break;
@@ -240,42 +446,48 @@ static void esp32_spi_do_command(Esp32SpiState* s, uint32_t cmd_reg)
     case R_SPI_CMD_PP_MASK:
         maybe_encrypt_data(s);
         t.cmd = CMD_PP;
+        t.cmd_bytes = 1;
         t.data = &s->data_reg[0];
         t.addr_bytes = bitlen_to_bytes(FIELD_EX32(s->user1_reg, SPI_USER1, ADDR_BITLEN));
-        t.addr = bswap32(s->addr_reg) >> 8;
+        t.addr = s->addr_reg;
         t.data = &s->data_reg[0];
         t.data_tx_bytes = s->addr_reg >> 24;
         break;
 
     case R_SPI_CMD_SE_MASK:
         t.cmd = CMD_SE;
+        t.cmd_bytes = 1;
         t.addr_bytes = bitlen_to_bytes(FIELD_EX32(s->user1_reg, SPI_USER1, ADDR_BITLEN));
-        t.addr = bswap32(s->addr_reg) >> (32 - t.addr_bytes * 8);
+        t.addr = s->addr_reg;
         break;
 
     case R_SPI_CMD_BE_MASK:
         t.cmd = CMD_BE;
+        t.cmd_bytes = 1;
         t.addr_bytes = bitlen_to_bytes(FIELD_EX32(s->user1_reg, SPI_USER1, ADDR_BITLEN));
-        t.addr = bswap32(s->addr_reg) >> (32 - t.addr_bytes * 8);
+        t.addr = s->addr_reg;
         break;
 
     case R_SPI_CMD_CE_MASK:
         t.cmd = CMD_CE;
+        t.cmd_bytes = 1;
         break;
 
     case R_SPI_CMD_DP_MASK:
         t.cmd = CMD_DP;
+        t.cmd_bytes = 1;
         break;
 
     case R_SPI_CMD_RES_MASK:
         t.cmd = CMD_RES;
+        t.cmd_bytes = 1;
         t.data = &s->data_reg[0];
         t.data_rx_bytes = 3;
         break;
 
     case R_SPI_CMD_USR_MASK:
         maybe_encrypt_data(s);
-        if (FIELD_EX32(s->user_reg, SPI_USER, COMMAND) || FIELD_EX32(s->user2_reg, SPI_USER2, COMMAND_BITLEN)) {
+        if (FIELD_EX32(s->user_reg, SPI_USER, COMMAND)) {
             t.cmd = FIELD_EX32(s->user2_reg, SPI_USER2, COMMAND_VALUE);
             t.cmd_bytes = bitlen_to_bytes(FIELD_EX32(s->user2_reg, SPI_USER2, COMMAND_BITLEN));
         } else {
@@ -283,7 +495,9 @@ static void esp32_spi_do_command(Esp32SpiState* s, uint32_t cmd_reg)
         }
         if (FIELD_EX32(s->user_reg, SPI_USER, ADDR)) {
             t.addr_bytes = bitlen_to_bytes(FIELD_EX32(s->user1_reg, SPI_USER1, ADDR_BITLEN));
-            t.addr = bswap32(s->addr_reg);
+            t.addr = s->addr_reg;
+        } else {
+            t.addr_bytes = 0;
         }
         if (FIELD_EX32(s->user_reg, SPI_USER, MOSI)) {
             t.data = &s->data_reg[0];
@@ -295,9 +509,11 @@ static void esp32_spi_do_command(Esp32SpiState* s, uint32_t cmd_reg)
         }
         break;
     default:
+        s->cmd_reg = 0;
         return;
     }
     esp32_spi_transaction(s, &t);
+    s->cmd_reg = 0;
 }
 
 
@@ -316,6 +532,11 @@ static void esp32_spi_reset_hold(Object *obj, ResetType type)
     s->user2_reg = FIELD_DP32(0, SPI_USER2, COMMAND_BITLEN, 4);
     s->user2_reg = FIELD_DP32(s->user2_reg, SPI_USER2, COMMAND_VALUE, 0);
     s->status_reg = 0;
+    memset(s->external_cs_valid, 0, sizeof(s->external_cs_valid));
+    for (int i = 0; i < ESP32_SPI_CS_COUNT; ++i) {
+        s->external_cs_level[i] = 1;
+        qemu_set_irq(s->cs_gpio[i], 1);
+    }
 }
 
 static void esp32_spi_realize(DeviceState *dev, Error **errp)
@@ -334,9 +555,12 @@ static void esp32_spi_init(Object *obj)
 
     s->spi = ssi_create_bus(DEVICE(s), "spi");
     qdev_init_gpio_out_named(DEVICE(s), &s->cs_gpio[0], SSI_GPIO_CS, ESP32_SPI_CS_COUNT);
+    qdev_init_gpio_in_named(DEVICE(s), esp32_spi_external_cs,
+                            ESP32_SPI_EXTERNAL_CS_GPIO, ESP32_SPI_CS_COUNT);
 }
 
 static Property esp32_spi_properties[] = {
+    DEFINE_PROP_INT32("id", Esp32SpiState, id, -1),
     DEFINE_PROP_END_OF_LIST(),
 };
 

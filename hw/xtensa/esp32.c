@@ -25,6 +25,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/xtensa/esp32.h"
 #include "hw/misc/ssi_psram.h"
+#include "hw/ssi/sx127x.h"
 #include "hw/sd/dwc_sdmmc.h"
 #include "core-esp32/core-isa.h"
 #include "qemu/datadir.h"
@@ -458,6 +459,7 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
         const hwaddr spi_base[] = {
             DR_REG_SPI0_BASE, DR_REG_SPI1_BASE, DR_REG_SPI2_BASE, DR_REG_SPI3_BASE
         };
+        qdev_prop_set_int32(DEVICE(&s->spi[i]), "id", i);
         qdev_realize(DEVICE(&s->spi[i]), &s->periph_bus, &error_fatal);
 
         esp32_soc_add_periph_device(sys_mem, &s->spi[i], spi_base[i]);
@@ -528,6 +530,12 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     esp32_soc_add_unimp_device(sys_mem, "esp32.i2s1", DR_REG_I2S1_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.rmt", DR_REG_RMT_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.pcnt", DR_REG_PCNT_BASE, 0x1000);
+    esp32_soc_add_unimp_device(sys_mem, "esp32.mcpwm", 0x3ff70000, 0x8000);
+    esp32_soc_add_unimp_device(sys_mem, "esp32.bb", 0x3ff5c000, 0x1000);
+    esp32_soc_add_unimp_device(sys_mem, "esp32.fe", 0x3ff45000, 0x2000);
+
+    /* Catch-all for remaining peripheral space to avoid panics */
+    esp32_soc_add_unimp_device(sys_mem, "esp32.periph_ext", 0x3ff78000, 0x8000);
 
     /* Emulation of a fake register used to mark that the chip is run via QEMU */
     MemoryRegion *apbctrl_mem = g_new(MemoryRegion, 1);
@@ -739,6 +747,50 @@ static void esp32_machine_init_psram(Esp32SocState *ss, uint32_t size_mbytes)
                                 qdev_get_gpio_in_named(psram, SSI_GPIO_CS, 0));
 }
 
+static void esp32_machine_init_sx127x(Esp32SocState *ss)
+{
+    DeviceState *radio_spi3_cs0 = NULL;
+
+    for (int spi_index = 2; spi_index <= 3; ++spi_index) {
+        DeviceState *spi_master = DEVICE(&ss->spi[spi_index]);
+        BusState *spi_bus = qdev_get_child_bus(spi_master, "spi");
+
+        int max_cs = (spi_index == 3) ? 0 : 1;
+        for (int cs = 0; cs <= max_cs; ++cs) {
+            DeviceState *radio = qdev_new(TYPE_SX127X);
+
+            qdev_prop_set_uint8(radio, "spi_id", spi_index);
+            qdev_prop_set_uint8(radio, "cs", cs);
+            qdev_realize_and_unref(radio, spi_bus, &error_fatal);
+            qdev_connect_gpio_out_named(spi_master, SSI_GPIO_CS, cs,
+                                        qdev_get_gpio_in_named(radio,
+                                                               SSI_GPIO_CS, 0));
+            if (spi_index == 3 && cs == 0) {
+                radio_spi3_cs0 = radio;
+            }
+        }
+    }
+
+    if (radio_spi3_cs0) {
+        /* DIO0 is the first unnamed GPIO output of sx127x. Connect to GPIO 26. */
+        qdev_connect_gpio_out(radio_spi3_cs0, 0,
+                              qdev_get_gpio_in(DEVICE(&ss->gpio), 26));
+    }
+
+    qdev_connect_gpio_out_named(DEVICE(&ss->gpio), ESP32_GPIO_OUT_GPIO, 27,
+                                qdev_get_gpio_in_named(DEVICE(&ss->spi[3]),
+                                                       ESP32_SPI_EXTERNAL_CS_GPIO,
+                                                       0));
+    qdev_connect_gpio_out_named(DEVICE(&ss->gpio), ESP32_GPIO_OUT_GPIO, 13,
+                                qdev_get_gpio_in_named(DEVICE(&ss->spi[3]),
+                                                       ESP32_SPI_EXTERNAL_CS_GPIO,
+                                                       1));
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "ESP32: fake SX127x attached to SPI2/SPI3 CS0/CS1; "
+                  "GPIO27/GPIO13 gate SPI3 CS0/CS1; DIO0->GPIO26\n");
+}
+
 static void esp32_machine_init_i2c(Esp32SocState *s)
 {
     /* It should be possible to create an I2C device from the command line,
@@ -825,6 +877,8 @@ static void esp32_machine_init(MachineState *machine)
     if (machine->ram_size > 0) {
         esp32_machine_init_psram(ss, (uint32_t) (machine->ram_size / MiB));
     }
+
+    esp32_machine_init_sx127x(ss);
 
     esp32_machine_init_i2c(ss);
 
