@@ -136,7 +136,13 @@ static void uart_write(void *opaque, hwaddr addr,
             error_report("esp_uart: write to UART FIFO while it is full");
         } else {
             uint8_t ch = (uint8_t) (value & 0xff);
-            fprintf(stderr, "esp32_uart: write to FIFO: 0x%02x '%c'\n", ch, isprint(ch) ? ch : '.');
+            if (s->raw_log) {
+                fputc(ch, s->raw_log);
+                fflush(s->raw_log);
+            }
+            if (getenv("QEMU_ESP32_ELRS_TRACE")) {
+                qemu_log("esp32_uart: write to FIFO: 0x%02x '%c'\n", ch, isprint(ch) ? ch : '.');
+            }
             fifo8_push(&s->tx_fifo, ch);
             uart_transmit(NULL, G_IO_OUT, s);
         }
@@ -346,6 +352,16 @@ static void esp32_uart_realize(DeviceState *dev, Error **errp)
 
     qemu_chr_fe_set_handlers(&s->chr, uart_can_receive, uart_receive,
                              uart_event, NULL, s, NULL, true);
+
+    const char *name = object_get_canonical_path_component(OBJECT(dev));
+    if (name) {
+        char *filename = g_strdup_printf("%s.log", name);
+        s->raw_log = fopen(filename, "w");
+        if (s->raw_log) {
+            setvbuf(s->raw_log, NULL, _IONBF, 0);
+        }
+        g_free(filename);
+    }
 }
 
 
