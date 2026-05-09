@@ -18,6 +18,7 @@ typedef struct SX127xState {
     uint8_t fifo[256];
     uint8_t fifo_pos;
     uint8_t spi_id;
+    bool dio_level[6];
 
     qemu_irq dio[6];
 } SX127xState;

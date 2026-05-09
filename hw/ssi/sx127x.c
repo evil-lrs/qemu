@@ -23,6 +23,7 @@
 #define SX127X_REG_PAYLOAD_LENGTH 0x22
 #define SX127X_REG_DIO_MAPPING1 0x40
 #define SX127X_REG_VERSION     0x42
+#define SX127X_IRQ_TX_DONE     0x08
 
 static const char *sx127x_reg_name(uint8_t addr)
 {
@@ -86,6 +87,7 @@ static void sx127x_load_defaults(SX127xState *s)
     s->is_write = false;
     s->addr = 0;
     s->fifo_pos = 0;
+    memset(s->dio_level, 0, sizeof(s->dio_level));
 }
 
 static int sx127x_set_cs(SSIPeripheral *ss, bool select)
@@ -111,7 +113,36 @@ static void sx127x_update_irq(SX127xState *s)
      * In SX127x, DIO0 mapping 00 is RxDone or TxDone.
      */
     bool irq = s->regs[SX127X_REG_IRQ_FLAGS] != 0;
+
+    if (s->dio_level[0] != irq) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SX127X[SPI%d:CS%d]: DIO0 %s irq=0x%02x\n",
+                      s->spi_id, s->parent_obj.cs_index,
+                      irq ? "high" : "low", s->regs[SX127X_REG_IRQ_FLAGS]);
+        s->dio_level[0] = irq;
+    }
     qemu_set_irq(s->dio[0], irq);
+}
+
+static void sx127x_log_tx_payload(SX127xState *s)
+{
+    uint8_t base = s->regs[SX127X_REG_FIFO_TX_BASE_ADDR];
+    uint8_t len = s->regs[SX127X_REG_PAYLOAD_LENGTH];
+    char payload[3 * 256 + 1];
+    size_t off = 0;
+    int i;
+
+    for (i = 0; i < len && off < sizeof(payload); i++) {
+        off += snprintf(payload + off, sizeof(payload) - off, "%s%02x",
+                        i == 0 ? "" : " ", s->fifo[(uint8_t)(base + i)]);
+    }
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "SX127X[SPI%d:CS%d]: TX len=%u freq=%02x%02x%02x "
+                  "modem1=%02x modem2=%02x payload=[%s]\n",
+                  s->spi_id, s->parent_obj.cs_index, len,
+                  s->regs[0x06], s->regs[0x07], s->regs[0x08],
+                  s->regs[0x1d], s->regs[0x1e], payload);
 }
 
 static uint8_t sx127x_read_reg(SX127xState *s, uint8_t addr)
@@ -120,6 +151,7 @@ static uint8_t sx127x_read_reg(SX127xState *s, uint8_t addr)
 
     if (addr == SX127X_REG_FIFO) {
         value = s->fifo[s->fifo_pos++];
+        s->regs[SX127X_REG_FIFO_ADDR_PTR] = s->fifo_pos;
     } else {
         value = s->regs[addr & 0x7f];
     }
@@ -142,13 +174,15 @@ static void sx127x_write_reg(SX127xState *s, uint8_t addr, uint8_t value)
 {
     if (addr == SX127X_REG_FIFO) {
         s->fifo[s->fifo_pos++] = value;
+        s->regs[SX127X_REG_FIFO_ADDR_PTR] = s->fifo_pos;
     } else if (addr == SX127X_REG_IRQ_FLAGS) {
         s->regs[SX127X_REG_IRQ_FLAGS] &= ~value;
     } else if (addr == SX127X_REG_OP_MODE) {
         s->regs[addr & 0x7f] = value;
         if ((value & 0x07) == 0x03) { /* TX mode */
-             /* Immediately trigger TX_DONE in RegIrqFlags */
-             s->regs[SX127X_REG_IRQ_FLAGS] |= 0x08; /* TxDone bit */
+            sx127x_log_tx_payload(s);
+            /* Immediately trigger TX_DONE in RegIrqFlags */
+            s->regs[SX127X_REG_IRQ_FLAGS] |= SX127X_IRQ_TX_DONE;
         }
     } else {
         s->regs[addr & 0x7f] = value;
@@ -206,7 +240,9 @@ static uint32_t sx127x_transfer(SSIPeripheral *ss, uint32_t tx)
      * Increment address only AFTER processing a data byte.
      * This allows the first data byte to hit the address specified in the command byte.
      */
-    s->addr = (s->addr + 1) & 0x7f;
+    if (s->addr != SX127X_REG_FIFO) {
+        s->addr = (s->addr + 1) & 0x7f;
+    }
     return ret;
 }
 
