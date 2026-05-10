@@ -116,6 +116,9 @@ static uint64_t esp32_spi_read(void *opaque, hwaddr addr, unsigned int size)
     switch (addr) {
     case A_SPI_CMD:
         r = s->cmd_reg;
+        if (s->id == 2 || s->id == 3) {
+            fprintf(stderr, "ESP32_SPI%d: read CMD -> 0x%08x\n", s->id, (uint32_t)r);
+        }
         break;
     case A_SPI_ADDR:
         r = s->addr_reg;

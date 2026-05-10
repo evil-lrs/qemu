@@ -127,11 +127,11 @@ static void esp32c3_spi_txrx_buffer(ESP32C3SpiState *s,
     int bytes = MAX(tx_bytes, rx_bytes);
     for (int i = 0; i < bytes; ++i) {
         uint8_t byte = 0;
-        if (byte < tx_bytes) {
+        if (i < tx_bytes) {
             memcpy(&byte, tx + i, 1);
         }
         uint32_t res = ssi_transfer(s->spi, byte);
-        if (byte < rx_bytes) {
+        if (i < rx_bytes) {
             memcpy(rx + i, &res, 1);
         }
     }
@@ -141,6 +141,30 @@ static void esp32c3_spi_dummy_cycles(ESP32C3SpiState *s, uint32_t dummy_bytes) {
     for (int i = 0; i < dummy_bytes; i++) {
         ssi_transfer(s->spi, 0);
     }
+}
+
+static bool esp32c3_spi_trace_enabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0) {
+        enabled = g_getenv("QEMU_ESP32C3_SPI_TRACE") ? 1 : 0;
+    }
+
+    return enabled;
+}
+
+static void esp32c3_spi_trace_transaction(const ESP32C3SpiTransaction *t)
+{
+    if (!esp32c3_spi_trace_enabled()) {
+        return;
+    }
+
+    fprintf(stderr,
+            "ESP32C3_SPI: cmd=0x%02x cmd_bytes=%u addr=0x%08x "
+            "addr_bytes=%u dummy_bytes=%u tx_bytes=%u rx_bytes=%u\n",
+            (uint8_t)t->cmd, t->cmd_bytes, t->addr, t->addr_bytes,
+            t->dummy_bytes, t->tx_bytes, t->rx_bytes);
 }
 
 static void esp32c3_spi_perform_transaction(ESP32C3SpiState *s, ESP32C3SpiTransaction *t)
@@ -154,6 +178,7 @@ static void esp32c3_spi_perform_transaction(ESP32C3SpiState *s, ESP32C3SpiTransa
             xts_aes_class->read_ciphertext(s->xts_aes, t->data, &(t->tx_bytes), &(t->addr), &(t->addr_bytes));
         }
     }
+    esp32c3_spi_trace_transaction(t);
     qemu_set_irq(s->cs_gpio[0], 0);
     esp32c3_spi_txrx_buffer(s, &t->cmd, t->cmd_bytes, NULL, 0);
     esp32c3_spi_txrx_buffer(s, &t->addr, t->addr_bytes, NULL, 0);
