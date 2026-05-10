@@ -29,7 +29,7 @@ quiet-command = $(quiet-@)$(call quiet-command-run,$1,$2,$3)
 UNCHECKED_GOALS := TAGS gtags cscope ctags dist \
     help check-help print-% \
     docker docker-% lcitool-refresh vm-help vm-test vm-build-% \
-    esp32-configure esp32-build esp32-clean \
+    esp32-configure esp32-build esp32-clean esp32-reconfigure \
     esp32c3-configure esp32c3-build esp32c3-clean esp32c3-reconfigure
 .PHONY: esp32-configure esp32-build esp32-clean esp32-reconfigure
 .PHONY: esp32c3-configure esp32c3-build esp32c3-clean esp32c3-reconfigure
@@ -40,35 +40,48 @@ BREW_PREFIX_GNUTLS := $(shell brew --prefix gnutls)
 NCPU := $(shell sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
 ESP32_PKG_CONFIG_PATH := $(BREW_PREFIX_LIBGCRYPT)/lib/pkgconfig:$(BREW_PREFIX_LIBGPG_ERROR)/lib/pkgconfig:$(BREW_PREFIX_GNUTLS)/lib/pkgconfig
+ESP32_BUILD_DIR = $(SRC_PATH)/build
 ESP32C3_BUILD_DIR = $(SRC_PATH)/build-esp32c3
 
 esp32-configure:
-	PKG_CONFIG_PATH="$(ESP32_PKG_CONFIG_PATH)" \
+	mkdir -p "$(ESP32_BUILD_DIR)"
+	cd "$(ESP32_BUILD_DIR)" && PKG_CONFIG_PATH="$(ESP32_PKG_CONFIG_PATH)" \
 	../configure \
 	  --target-list=xtensa-softmmu \
+	  --disable-user \
+	  --disable-linux-user \
+	  --disable-bsd-user \
 	  --disable-gnutls --enable-gcrypt \
+	  --disable-docs \
 	  --disable-gtk \
 	  --disable-sdl \
 	  --disable-cocoa \
 	  --disable-vnc \
 	  --disable-opengl \
 	  --disable-virglrenderer \
+	  --disable-guest-agent \
+	  --disable-plugins \
+	  --disable-slirp \
+	  --disable-gio \
 	  --enable-debug \
 	  --disable-strip \
+	  --without-default-features \
 	  --disable-werror
 
 esp32-build:
-	@if [ ! -f config-host.mak ]; then \
+	@if [ ! -f "$(ESP32_BUILD_DIR)/config-host.mak" ]; then \
 		$(MAKE) esp32-configure; \
 	fi
-	$(MAKE) -j"$(NCPU)" all
+	$(MAKE) -C "$(ESP32_BUILD_DIR)" -j"$(NCPU)" all
 
 esp32-reconfigure:
-	rm -f config-host.mak config.status
+	rm -rf "$(ESP32_BUILD_DIR)" GNUmakefile
 	$(MAKE) esp32-configure
 
 esp32-clean:
-	$(MAKE) clean
+	@if [ -f "$(ESP32_BUILD_DIR)/Makefile" ]; then \
+		$(MAKE) -C "$(ESP32_BUILD_DIR)" clean; \
+	fi
 
 esp32c3-configure:
 	mkdir -p "$(ESP32C3_BUILD_DIR)"
