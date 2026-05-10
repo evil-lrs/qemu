@@ -20,12 +20,14 @@
 #include "hw/i2c/esp32_i2c.h"
 #include "hw/xtensa/xtensa_memory.h"
 #include "hw/misc/unimp.h"
+#include "hw/misc/esp_radio_config.h"
 #include "hw/irq.h"
 #include "hw/i2c/i2c.h"
 #include "hw/qdev-properties.h"
 #include "hw/xtensa/esp32.h"
 #include "hw/misc/ssi_psram.h"
 #include "hw/ssi/sx127x.h"
+#include "hw/ssi/sx128x.h"
 #include "hw/sd/dwc_sdmmc.h"
 #include "core-esp32/core-isa.h"
 #include "qemu/datadir.h"
@@ -703,6 +705,8 @@ struct Esp32MachineState {
 
     Esp32SocState esp32;
     DeviceState *flash_dev;
+    char *radio_config;
+    char *radio_chip;
 };
 #define TYPE_ESP32_MACHINE MACHINE_TYPE_NAME("esp32")
 
@@ -747,9 +751,23 @@ static void esp32_machine_init_psram(Esp32SocState *ss, uint32_t size_mbytes)
                                 qdev_get_gpio_in_named(psram, SSI_GPIO_CS, 0));
 }
 
-static void esp32_machine_init_sx127x(Esp32SocState *ss)
+static void esp32_machine_init_radios(Esp32SocState *ss, const char *radio_chip)
 {
     DeviceState *radio_spi3_cs0 = NULL;
+    const char *type_name;
+    const char *display_name;
+    const char *irq_pin_label;
+
+    /* Pick QEMU device type from radio-chip option. Default is sx127x. */
+    if (radio_chip && g_ascii_strcasecmp(radio_chip, "sx128x") == 0) {
+        type_name = TYPE_SX128X;
+        display_name = "SX128x";
+        irq_pin_label = "DIO1"; /* SX128x routes IRQs to DIO1 by convention */
+    } else {
+        type_name = TYPE_SX127X;
+        display_name = "SX127x";
+        irq_pin_label = "DIO0";
+    }
 
     for (int spi_index = 2; spi_index <= 3; ++spi_index) {
         DeviceState *spi_master = DEVICE(&ss->spi[spi_index]);
@@ -757,7 +775,7 @@ static void esp32_machine_init_sx127x(Esp32SocState *ss)
 
         int max_cs = (spi_index == 3) ? 0 : 1;
         for (int cs = 0; cs <= max_cs; ++cs) {
-            DeviceState *radio = qdev_new(TYPE_SX127X);
+            DeviceState *radio = qdev_new(type_name);
 
             qdev_prop_set_uint8(radio, "spi_id", spi_index);
             qdev_prop_set_uint8(radio, "cs", cs);
@@ -772,7 +790,12 @@ static void esp32_machine_init_sx127x(Esp32SocState *ss)
     }
 
     if (radio_spi3_cs0) {
-        /* DIO0 is the first unnamed GPIO output of sx127x. Connect to GPIO 26. */
+        /*
+         * Connect the radio's primary IRQ output to GPIO26. For SX127x this
+         * is DIO0 (gpio_out index 0). For SX128x the device exposes
+         * DIO1/DIO2/DIO3 at indices 0/1/2, so index 0 is also the primary
+         * IRQ pin. Index 0 works for both chips.
+         */
         qdev_connect_gpio_out(radio_spi3_cs0, 0,
                               qdev_get_gpio_in(DEVICE(&ss->gpio), 26));
     }
@@ -787,8 +810,9 @@ static void esp32_machine_init_sx127x(Esp32SocState *ss)
                                                        1));
 
     qemu_log_mask(LOG_GUEST_ERROR,
-                  "ESP32: fake SX127x attached to SPI2/SPI3 CS0/CS1; "
-                  "GPIO27/GPIO13 gate SPI3 CS0/CS1; DIO0->GPIO26\n");
+                  "ESP32: fake %s attached to SPI2/SPI3 CS0/CS1; "
+                  "GPIO27/GPIO13 gate SPI3 CS0/CS1; %s->GPIO26\n",
+                  display_name, irq_pin_label);
 }
 
 static void esp32_machine_init_i2c(Esp32SocState *s)
@@ -855,6 +879,8 @@ static void esp32_machine_init(MachineState *machine)
     }
 
     Esp32MachineState *ms = ESP32_MACHINE(machine);
+    esp_radio_config_log("ESP32", ms->radio_config);
+    esp_radio_chip_log("ESP32", ms->radio_chip);
     object_initialize_child(OBJECT(ms), "soc", &ms->esp32, TYPE_ESP32_SOC);
     Esp32SocState *ss = ESP32_SOC(&ms->esp32);
 
@@ -878,7 +904,7 @@ static void esp32_machine_init(MachineState *machine)
         esp32_machine_init_psram(ss, (uint32_t) (machine->ram_size / MiB));
     }
 
-    esp32_machine_init_sx127x(ss);
+    esp32_machine_init_radios(ss, ms->radio_chip);
 
     esp32_machine_init_i2c(ss);
 
@@ -975,6 +1001,8 @@ static ram_addr_t esp32_fixup_ram_size(ram_addr_t requested_size)
     return size;
 }
 
+ESP_RADIO_OPTIONS_DEFINE_ACCESSORS(esp32_machine, Esp32MachineState, ESP32_MACHINE)
+
 /* Initialize machine type */
 static void esp32_machine_class_init(ObjectClass *oc, void *data)
 {
@@ -985,6 +1013,8 @@ static void esp32_machine_class_init(ObjectClass *oc, void *data)
     mc->default_cpus = 2;
     mc->default_ram_size = 0;
     mc->fixup_ram_size = esp32_fixup_ram_size;
+
+    ESP_RADIO_OPTIONS_ADD_PROPS(oc, esp32_machine);
 }
 
 static const TypeInfo esp32_info = {

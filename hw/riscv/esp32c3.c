@@ -50,6 +50,7 @@
 #include "hw/dma/esp32c3_gdma.h"
 #include "hw/display/esp_rgb.h"
 #include "hw/net/can/esp32c3_twai.h"
+#include "hw/misc/esp_radio_config.h"
 
 #define ESP32C3_IO_WARNING          0
 
@@ -90,6 +91,8 @@ struct Esp32C3MachineState {
     ESP32C3UsbJtagState jtag;
     ESPRgbState rgb;
     Esp32C3TWAIState twai;
+    char *radio_config;
+    char *radio_chip;
 };
 
 /* Fake register used by ESP-IDF application to determine whether the code is running on real hardware or on QEMU */
@@ -340,6 +343,8 @@ static void esp32c3_machine_init(MachineState *machine)
 
     /* Re-use the macro that checks and casts any generic/parent class to the real child instance */
     Esp32C3MachineState *ms = ESP32C3_MACHINE(machine);
+    esp_radio_config_log("ESP32-C3", ms->radio_config);
+    esp_radio_chip_log("ESP32-C3", ms->radio_chip);
 
     /* Initialize SoC */
     object_initialize_child(OBJECT(ms), "soc", &ms->soc, TYPE_ESP_RISCV_CPU);
@@ -659,6 +664,8 @@ static void esp32c3_machine_init(MachineState *machine)
 }
 
 
+ESP_RADIO_OPTIONS_DEFINE_ACCESSORS(esp32c3_machine, Esp32C3MachineState, ESP32C3_MACHINE)
+
 /* Initialize machine type */
 static void esp32c3_machine_class_init(ObjectClass *oc, void *data)
 {
@@ -670,6 +677,8 @@ static void esp32c3_machine_class_init(ObjectClass *oc, void *data)
     mc->default_cpus = 1;
     // 0x4f600
     mc->default_ram_size = 400 * 1024;
+
+    ESP_RADIO_OPTIONS_ADD_PROPS(oc, esp32c3_machine);
 }
 
 /* Create a new type of machine ("child class") */
