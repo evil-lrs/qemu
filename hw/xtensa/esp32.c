@@ -28,6 +28,7 @@
 #include "hw/misc/ssi_psram.h"
 #include "hw/ssi/sx127x.h"
 #include "hw/ssi/sx128x.h"
+#include "hw/ssi/lr1121.h"
 #include "hw/sd/dwc_sdmmc.h"
 #include "core-esp32/core-isa.h"
 #include "qemu/datadir.h"
@@ -764,6 +765,10 @@ static void esp32_machine_init_radios(Esp32SocState *ss, const char *radio_chip,
         type_name = TYPE_SX128X;
         display_name = "SX128x";
         irq_pin_label = "DIO1"; /* SX128x routes IRQs to DIO1 by convention */
+    } else if (radio_chip && g_ascii_strcasecmp(radio_chip, "lr1121") == 0) {
+        type_name = TYPE_LR1121;
+        display_name = "LR1121";
+        irq_pin_label = "DIO1";
     } else {
         type_name = TYPE_SX127X;
         display_name = "SX127x";
