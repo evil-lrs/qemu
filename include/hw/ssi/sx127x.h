@@ -1,6 +1,7 @@
 #pragma once
 
 #include "hw/ssi/ssi.h"
+#include "hw/ssi/semtech_radio_common.h"
 
 #define TYPE_SX127X "sx127x"
 OBJECT_DECLARE_SIMPLE_TYPE(SX127xState, SX127X)
@@ -21,4 +22,9 @@ typedef struct SX127xState {
     bool dio_level[6];
 
     qemu_irq dio[6];
+
+    /* Air bus and logging */
+    SemtechRadioAirBus air_bus;
+    char *radio_id;
+    char *tx_log_path;
 } SX127xState;

@@ -321,6 +321,7 @@ struct Esp32s3MachineState {
     DeviceState *flash_dev;
     char *radio_config;
     char *radio_chip;
+    char *radio_air_chardev;
 };
 #define TYPE_ESP32S3_MACHINE MACHINE_TYPE_NAME("esp32s3")
 

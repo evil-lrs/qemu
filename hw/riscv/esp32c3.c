@@ -93,6 +93,7 @@ struct Esp32C3MachineState {
     Esp32C3TWAIState twai;
     char *radio_config;
     char *radio_chip;
+    char *radio_air_chardev;
 };
 
 /* Fake register used by ESP-IDF application to determine whether the code is running on real hardware or on QEMU */

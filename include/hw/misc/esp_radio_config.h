@@ -43,6 +43,18 @@
         MachineStateT *ms = CAST_MACRO(obj);                                  \
         g_free(ms->radio_chip);                                               \
         ms->radio_chip = g_strdup(value);                                     \
+    }                                                                         \
+    static char *prefix##_get_radio_air_chardev(Object *obj, Error **errp)    \
+    {                                                                         \
+        MachineStateT *ms = CAST_MACRO(obj);                                  \
+        return g_strdup(ms->radio_air_chardev);                               \
+    }                                                                         \
+    static void prefix##_set_radio_air_chardev(Object *obj, const char *value,\
+                                               Error **errp)                  \
+    {                                                                         \
+        MachineStateT *ms = CAST_MACRO(obj);                                  \
+        g_free(ms->radio_air_chardev);                                        \
+        ms->radio_air_chardev = g_strdup(value);                              \
     }
 
 #define ESP_RADIO_OPTIONS_ADD_PROPS(oc, prefix)                               \
@@ -56,6 +68,10 @@
         object_class_property_set_description((oc), "radio-chip",             \
             "Radio chip identifier (e.g. sx127x, sx128x). "                   \
             "Selects which radio device QEMU instantiates.");                 \
+        object_class_property_add_str((oc), "radio-air-chardev",              \
+            prefix##_get_radio_air_chardev, prefix##_set_radio_air_chardev);  \
+        object_class_property_set_description((oc), "radio-air-chardev",      \
+            "Chardev ID for the primary radio air-bus connection");           \
     } while (0)
 
 /* Backwards-compat aliases for the radio-config-only helpers. */

@@ -707,6 +707,7 @@ struct Esp32MachineState {
     DeviceState *flash_dev;
     char *radio_config;
     char *radio_chip;
+    char *radio_air_chardev;
 };
 #define TYPE_ESP32_MACHINE MACHINE_TYPE_NAME("esp32")
 
@@ -751,7 +752,7 @@ static void esp32_machine_init_psram(Esp32SocState *ss, uint32_t size_mbytes)
                                 qdev_get_gpio_in_named(psram, SSI_GPIO_CS, 0));
 }
 
-static void esp32_machine_init_radios(Esp32SocState *ss, const char *radio_chip)
+static void esp32_machine_init_radios(Esp32SocState *ss, const char *radio_chip, const char *air_chardev_name)
 {
     DeviceState *radio_spi3_cs0 = NULL;
     const char *type_name;
@@ -769,6 +770,14 @@ static void esp32_machine_init_radios(Esp32SocState *ss, const char *radio_chip)
         irq_pin_label = "DIO0";
     }
 
+    Chardev *air_chr = NULL;
+    if (air_chardev_name) {
+        air_chr = qemu_chr_find(air_chardev_name);
+        if (!air_chr) {
+            error_report("Error: chardev '%s' not found for radio-air-chardev", air_chardev_name);
+        }
+    }
+
     for (int spi_index = 2; spi_index <= 3; ++spi_index) {
         DeviceState *spi_master = DEVICE(&ss->spi[spi_index]);
         BusState *spi_bus = qdev_get_child_bus(spi_master, "spi");
@@ -776,9 +785,18 @@ static void esp32_machine_init_radios(Esp32SocState *ss, const char *radio_chip)
         int max_cs = (spi_index == 3) ? 0 : 1;
         for (int cs = 0; cs <= max_cs; ++cs) {
             DeviceState *radio = qdev_new(type_name);
+            char *id = g_strdup_printf("radio-spi%d-cs%d", spi_index, cs);
+            object_property_add_child(OBJECT(ss), id, OBJECT(radio));
+            g_free(id);
 
             qdev_prop_set_uint8(radio, "spi_id", spi_index);
             qdev_prop_set_uint8(radio, "cs", cs);
+
+            /* Apply air-bus chardev ONLY to the primary radio (SPI3 CS0) */
+            if (spi_index == 3 && cs == 0 && air_chr) {
+                qdev_prop_set_chr(radio, "air-chardev", air_chr);
+            }
+
             qdev_realize_and_unref(radio, spi_bus, &error_fatal);
             qdev_connect_gpio_out_named(spi_master, SSI_GPIO_CS, cs,
                                         qdev_get_gpio_in_named(radio,
@@ -904,7 +922,7 @@ static void esp32_machine_init(MachineState *machine)
         esp32_machine_init_psram(ss, (uint32_t) (machine->ram_size / MiB));
     }
 
-    esp32_machine_init_radios(ss, ms->radio_chip);
+    esp32_machine_init_radios(ss, ms->radio_chip, ms->radio_air_chardev);
 
     esp32_machine_init_i2c(ss);
 
