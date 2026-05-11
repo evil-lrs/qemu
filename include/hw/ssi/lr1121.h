@@ -7,6 +7,8 @@
 #include "qom/object.h"
 
 #define TYPE_LR1121 "lr1121"
+#define LR1121_DIO_GPIO "dio"
+#define LR1121_BUSY_GPIO "busy"
 OBJECT_DECLARE_SIMPLE_TYPE(LR1121State, LR1121)
 
 #define LR1121_DIO_COUNT 3

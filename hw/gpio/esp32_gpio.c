@@ -83,6 +83,15 @@ static void esp32_gpio_set_input(void *opaque, int n, int level)
         } else {
             s->in_level1 &= ~BIT(n - 32);
         }
+    } else {
+        return;
+    }
+
+    if (s->input_set_log_count < 32) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32_GPIO: input gpio=%d level=%d\n",
+                      n, level ? 1 : 0);
+        s->input_set_log_count++;
     }
 }
 
@@ -238,6 +247,7 @@ static void esp32_gpio_reset_hold(Object *obj, ResetType type)
     s->in_level = ~0;
     s->in_level1 = ~0;
     s->input_log_count = 0;
+    s->input_set_log_count = 0;
 
     for (unsigned pin = 0; pin < ESP32_GPIO_PIN_COUNT; ++pin) {
         qemu_set_irq(s->gpio_out[pin], 1);
@@ -261,7 +271,8 @@ static void esp32_gpio_init(Object *obj)
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq);
     qdev_init_gpio_out_named(DEVICE(obj), s->gpio_out, ESP32_GPIO_OUT_GPIO, ESP32_GPIO_PIN_COUNT);
-    qdev_init_gpio_in(DEVICE(obj), esp32_gpio_set_input, ESP32_GPIO_PIN_COUNT);
+    qdev_init_gpio_in_named(DEVICE(obj), esp32_gpio_set_input,
+                            ESP32_GPIO_IN_GPIO, ESP32_GPIO_PIN_COUNT);
 }
 
 static Property esp32_gpio_properties[] = {

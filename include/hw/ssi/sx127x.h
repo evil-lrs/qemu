@@ -4,6 +4,7 @@
 #include "hw/ssi/semtech_radio_common.h"
 
 #define TYPE_SX127X "sx127x"
+#define SX127X_DIO_GPIO "dio"
 OBJECT_DECLARE_SIMPLE_TYPE(SX127xState, SX127X)
 
 typedef struct SX127xState {

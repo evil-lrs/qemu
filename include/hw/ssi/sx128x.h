@@ -5,6 +5,8 @@
 #include "qom/object.h"
 
 #define TYPE_SX128X "sx128x"
+#define SX128X_DIO_GPIO "dio"
+#define SX128X_BUSY_GPIO "busy"
 OBJECT_DECLARE_SIMPLE_TYPE(SX128xState, SX128X)
 
 /*
@@ -75,6 +77,7 @@ typedef struct SX128xState {
     uint8_t spi_id;
     bool dio_level[SX128X_DIO_COUNT];
     qemu_irq dio[SX128X_DIO_COUNT];
+    qemu_irq busy;
 } SX128xState;
 
 #endif /* HW_SSI_SX128X_H */

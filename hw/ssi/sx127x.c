@@ -406,7 +406,7 @@ static void sx127x_instance_init(Object *obj)
 {
     SX127xState *s = SX127X(obj);
 
-    qdev_init_gpio_out(DEVICE(s), s->dio, 6);
+    qdev_init_gpio_out_named(DEVICE(s), s->dio, SX127X_DIO_GPIO, 6);
 }
 
 static const TypeInfo sx127x_info = {

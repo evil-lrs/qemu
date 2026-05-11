@@ -170,6 +170,7 @@ static void sx128x_load_defaults(SX128xState *s)
     memcpy(&s->regs[0x01F0], version_str, sizeof(version_str));
 
     memset(s->dio_level, 0, sizeof(s->dio_level));
+    qemu_set_irq(s->busy, 0);
 }
 
 static int sx128x_set_cs(SSIPeripheral *ss, bool select)
@@ -496,7 +497,9 @@ static void sx128x_class_init(ObjectClass *klass, void *data)
 static void sx128x_instance_init(Object *obj)
 {
     SX128xState *s = SX128X(obj);
-    qdev_init_gpio_out(DEVICE(s), s->dio, SX128X_DIO_COUNT);
+    qdev_init_gpio_out_named(DEVICE(s), s->dio,
+                             SX128X_DIO_GPIO, SX128X_DIO_COUNT);
+    qdev_init_gpio_out_named(DEVICE(s), &s->busy, SX128X_BUSY_GPIO, 1);
 }
 
 static const TypeInfo sx128x_info = {

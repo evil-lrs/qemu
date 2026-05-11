@@ -51,6 +51,7 @@
 #include "hw/display/esp_rgb.h"
 #include "hw/net/can/esp32c3_twai.h"
 #include "hw/misc/esp_radio_config.h"
+#include "hw/misc/esp_radio_board.h"
 
 #define ESP32C3_IO_WARNING          0
 
@@ -346,6 +347,24 @@ static void esp32c3_machine_init(MachineState *machine)
     Esp32C3MachineState *ms = ESP32C3_MACHINE(machine);
     esp_radio_config_log("ESP32-C3", ms->radio_config);
     esp_radio_chip_log("ESP32-C3", ms->radio_chip);
+
+    EspRadioBoardConfig radio_cfg;
+    esp_radio_board_config_init(&radio_cfg);
+    if (ms->radio_config) {
+        Error *err = NULL;
+        if (!esp_radio_board_config_load(ms->radio_config, &radio_cfg, &err)) {
+            error_report_err(err);
+            exit(1);
+        }
+        qemu_log("ESP32-C3 radio board: type=%s chips=%d nss=%d busy=%d "
+                 "dio1=%d miso=%d mosi=%d sck=%d\n",
+                 esp_radio_type_str(radio_cfg.type),
+                 radio_cfg.chip_count,
+                 radio_cfg.chips[0].nss,
+                 radio_cfg.chips[0].busy,
+                 radio_cfg.chips[0].dio1,
+                 radio_cfg.miso, radio_cfg.mosi, radio_cfg.sck);
+    }
 
     /* Initialize SoC */
     object_initialize_child(OBJECT(ms), "soc", &ms->soc, TYPE_ESP_RISCV_CPU);

@@ -15,6 +15,7 @@ REG32(GPIO_STRAP, 0x0038)
 #define ESP32_STRAP_MODE_UART_BOOT  0x0f
 #define ESP32_GPIO_PIN_COUNT        40
 #define ESP32_GPIO_OUT_GPIO         "gpio-out"
+#define ESP32_GPIO_IN_GPIO          "gpio-in"
 
 typedef struct Esp32GpioState {
     SysBusDevice parent_obj;
@@ -31,6 +32,7 @@ typedef struct Esp32GpioState {
     uint32_t in_level;
     uint32_t in_level1;
     uint32_t input_log_count;
+    uint32_t input_set_log_count;
 } Esp32GpioState;
 
 typedef struct Esp32GpioClass {

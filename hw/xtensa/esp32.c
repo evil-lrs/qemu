@@ -21,6 +21,7 @@
 #include "hw/xtensa/xtensa_memory.h"
 #include "hw/misc/unimp.h"
 #include "hw/misc/esp_radio_config.h"
+#include "hw/misc/esp_radio_board.h"
 #include "hw/irq.h"
 #include "hw/i2c/i2c.h"
 #include "hw/qdev-properties.h"
@@ -753,26 +754,145 @@ static void esp32_machine_init_psram(Esp32SocState *ss, uint32_t size_mbytes)
                                 qdev_get_gpio_in_named(psram, SSI_GPIO_CS, 0));
 }
 
-static void esp32_machine_init_radios(Esp32SocState *ss, const char *radio_chip, const char *air_chardev_name)
+/*
+ * Default SPI bus that radio devices attach to on ESP32 when no JSON
+ * config is provided. SPI3 (VSPI) is the Arduino-default bus used by
+ * existing smoke firmware.
+ */
+#define ESP32_RADIO_DEFAULT_SPI 3
+
+static void esp32_machine_attach_radio(Esp32SocState *ss,
+                                       const char *type_name,
+                                       int spi_index, int cs,
+                                       Chardev *air_chr,
+                                       DeviceState **out_radio)
+{
+    DeviceState *spi_master = DEVICE(&ss->spi[spi_index]);
+    BusState *spi_bus = qdev_get_child_bus(spi_master, "spi");
+
+    DeviceState *radio = qdev_new(type_name);
+    char *id = g_strdup_printf("radio-spi%d-cs%d", spi_index, cs);
+    object_property_add_child(OBJECT(ss), id, OBJECT(radio));
+    g_free(id);
+
+    qdev_prop_set_uint8(radio, "spi_id", spi_index);
+    qdev_prop_set_uint8(radio, "cs", cs);
+    if (air_chr) {
+        qdev_prop_set_chr(radio, "air-chardev", air_chr);
+    }
+
+    qdev_realize_and_unref(radio, spi_bus, &error_fatal);
+    qdev_connect_gpio_out_named(spi_master, SSI_GPIO_CS, cs,
+                                qdev_get_gpio_in_named(radio,
+                                                       SSI_GPIO_CS, 0));
+    if (out_radio) {
+        *out_radio = radio;
+    }
+}
+
+static bool esp32_gpio_pin_valid(int pin)
+{
+    return pin >= 0 && pin < ESP32_GPIO_PIN_COUNT;
+}
+
+static void esp32_machine_connect_radio_dio(Esp32SocState *ss,
+                                            DeviceState *radio,
+                                            const char *gpio_name,
+                                            int dio_index,
+                                            int gpio_pin,
+                                            int chip_index,
+                                            const char *label)
+{
+    if (!esp32_gpio_pin_valid(gpio_pin)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32 radio DIO: chip[%d].%s has no valid gpio "
+                      "(got %d); skipping\n",
+                      chip_index, label, gpio_pin);
+        return;
+    }
+
+    qdev_connect_gpio_out_named(radio, gpio_name, dio_index,
+                                qdev_get_gpio_in_named(DEVICE(&ss->gpio),
+                                                       ESP32_GPIO_IN_GPIO,
+                                                       gpio_pin));
+    qemu_log("ESP32 radio DIO: chip[%d].%s -> gpio=%d\n",
+             chip_index, label, gpio_pin);
+}
+
+static void esp32_machine_connect_radio_busy(Esp32SocState *ss,
+                                             DeviceState *radio,
+                                             const char *gpio_name,
+                                             int gpio_pin,
+                                             int chip_index)
+{
+    if (!esp32_gpio_pin_valid(gpio_pin)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32 radio BUSY: chip[%d].busy has no valid gpio "
+                      "(got %d); skipping\n",
+                      chip_index, gpio_pin);
+        return;
+    }
+
+    qdev_connect_gpio_out_named(radio, gpio_name, 0,
+                                qdev_get_gpio_in_named(DEVICE(&ss->gpio),
+                                                       ESP32_GPIO_IN_GPIO,
+                                                       gpio_pin));
+    qemu_log("ESP32 radio BUSY: chip[%d].busy -> gpio=%d\n",
+             chip_index, gpio_pin);
+}
+
+static void esp32_machine_connect_radio_signals(Esp32SocState *ss,
+                                                DeviceState *radio,
+                                                EspRadioType type,
+                                                const EspRadioChipConfig *chip,
+                                                int chip_index)
+{
+    switch (type) {
+    case ESP_RADIO_SX127X:
+        esp32_machine_connect_radio_dio(ss, radio, SX127X_DIO_GPIO, 0,
+                                        chip->dio0, chip_index, "dio0");
+        esp32_machine_connect_radio_dio(ss, radio, SX127X_DIO_GPIO, 1,
+                                        chip->dio1, chip_index, "dio1");
+        break;
+    case ESP_RADIO_SX128X:
+        esp32_machine_connect_radio_dio(ss, radio, SX128X_DIO_GPIO, 0,
+                                        chip->dio1, chip_index, "dio1");
+        esp32_machine_connect_radio_busy(ss, radio, SX128X_BUSY_GPIO,
+                                         chip->busy, chip_index);
+        break;
+    case ESP_RADIO_LR1121:
+        esp32_machine_connect_radio_dio(ss, radio, LR1121_DIO_GPIO, 0,
+                                        chip->dio1, chip_index, "dio1");
+        esp32_machine_connect_radio_busy(ss, radio, LR1121_BUSY_GPIO,
+                                         chip->busy, chip_index);
+        break;
+    case ESP_RADIO_NONE:
+        break;
+    }
+}
+
+static void esp32_machine_init_radios(Esp32SocState *ss,
+                                      const EspRadioBoardConfig *cfg,
+                                      const char *radio_chip,
+                                      const char *air_chardev_name)
 {
     DeviceState *radio_spi3_cs0 = NULL;
     const char *type_name;
     const char *display_name;
-    const char *irq_pin_label;
+    bool from_cfg = (cfg && cfg->type != ESP_RADIO_NONE);
 
-    /* Pick QEMU device type from radio-chip option. Default is sx127x. */
-    if (radio_chip && g_ascii_strcasecmp(radio_chip, "sx128x") == 0) {
+    if (from_cfg) {
+        type_name = esp_radio_qdev_type(cfg->type);
+        display_name = esp_radio_type_str(cfg->type);
+    } else if (radio_chip && g_ascii_strcasecmp(radio_chip, "sx128x") == 0) {
         type_name = TYPE_SX128X;
         display_name = "SX128x";
-        irq_pin_label = "DIO1"; /* SX128x routes IRQs to DIO1 by convention */
     } else if (radio_chip && g_ascii_strcasecmp(radio_chip, "lr1121") == 0) {
         type_name = TYPE_LR1121;
         display_name = "LR1121";
-        irq_pin_label = "DIO1";
     } else {
         type_name = TYPE_SX127X;
         display_name = "SX127x";
-        irq_pin_label = "DIO0";
     }
 
     Chardev *air_chr = NULL;
@@ -783,59 +903,101 @@ static void esp32_machine_init_radios(Esp32SocState *ss, const char *radio_chip,
         }
     }
 
-    for (int spi_index = 2; spi_index <= 3; ++spi_index) {
-        DeviceState *spi_master = DEVICE(&ss->spi[spi_index]);
-        BusState *spi_bus = qdev_get_child_bus(spi_master, "spi");
+    if (from_cfg) {
+        int spi_index = ESP32_RADIO_DEFAULT_SPI;
+        int chip_count = cfg->chip_count > 0 ? cfg->chip_count : 1;
 
-        int max_cs = (spi_index == 3) ? 0 : 1;
-        for (int cs = 0; cs <= max_cs; ++cs) {
-            DeviceState *radio = qdev_new(type_name);
-            char *id = g_strdup_printf("radio-spi%d-cs%d", spi_index, cs);
-            object_property_add_child(OBJECT(ss), id, OBJECT(radio));
-            g_free(id);
+        qemu_log("ESP32 radio board: type=%s chips=%d spi=%d\n",
+                 display_name, chip_count, spi_index);
 
-            qdev_prop_set_uint8(radio, "spi_id", spi_index);
-            qdev_prop_set_uint8(radio, "cs", cs);
-
-            /* Apply air-bus chardev ONLY to the primary radio (SPI3 CS0) */
-            if (spi_index == 3 && cs == 0 && air_chr) {
-                qdev_prop_set_chr(radio, "air-chardev", air_chr);
-            }
-
-            qdev_realize_and_unref(radio, spi_bus, &error_fatal);
-            qdev_connect_gpio_out_named(spi_master, SSI_GPIO_CS, cs,
-                                        qdev_get_gpio_in_named(radio,
-                                                               SSI_GPIO_CS, 0));
-            if (spi_index == 3 && cs == 0) {
+        for (int i = 0; i < chip_count && i < 2; i++) {
+            DeviceState *radio = NULL;
+            esp32_machine_attach_radio(ss, type_name, spi_index, i,
+                                       (i == 0) ? air_chr : NULL,
+                                       &radio);
+            qemu_log("ESP32 radio chip[%d]: qdev=%s nss=%d dio1=%d "
+                     "busy=%d rst=%d dio0=%d\n",
+                     i, type_name,
+                     cfg->chips[i].nss,
+                     cfg->chips[i].dio1,
+                     cfg->chips[i].busy,
+                     cfg->chips[i].rst,
+                     cfg->chips[i].dio0);
+            if (i == 0) {
                 radio_spi3_cs0 = radio;
+            }
+            esp32_machine_connect_radio_signals(ss, radio, cfg->type,
+                                                &cfg->chips[i], i);
+        }
+    } else {
+        for (int spi_index = 2; spi_index <= 3; ++spi_index) {
+            int max_cs = (spi_index == 3) ? 0 : 1;
+            for (int cs = 0; cs <= max_cs; ++cs) {
+                DeviceState *radio = NULL;
+                esp32_machine_attach_radio(ss, type_name, spi_index, cs,
+                                           (spi_index == 3 && cs == 0)
+                                               ? air_chr : NULL,
+                                           &radio);
+                if (spi_index == 3 && cs == 0) {
+                    radio_spi3_cs0 = radio;
+                }
             }
         }
     }
 
     if (radio_spi3_cs0) {
-        /*
-         * Connect the radio's primary IRQ output to GPIO26. For SX127x this
-         * is DIO0 (gpio_out index 0). For SX128x the device exposes
-         * DIO1/DIO2/DIO3 at indices 0/1/2, so index 0 is also the primary
-         * IRQ pin. Index 0 works for both chips.
-         */
-        qdev_connect_gpio_out(radio_spi3_cs0, 0,
-                              qdev_get_gpio_in(DEVICE(&ss->gpio), 26));
+        if (!from_cfg) {
+            const char *dio_gpio = (g_strcmp0(type_name, TYPE_SX127X) == 0)
+                                 ? SX127X_DIO_GPIO
+                                 : (g_strcmp0(type_name, TYPE_SX128X) == 0)
+                                 ? SX128X_DIO_GPIO
+                                 : LR1121_DIO_GPIO;
+
+            esp32_machine_connect_radio_dio(ss, radio_spi3_cs0, dio_gpio, 0,
+                                            26, 0, "primary");
+        }
     }
 
-    qdev_connect_gpio_out_named(DEVICE(&ss->gpio), ESP32_GPIO_OUT_GPIO, 27,
-                                qdev_get_gpio_in_named(DEVICE(&ss->spi[3]),
-                                                       ESP32_SPI_EXTERNAL_CS_GPIO,
-                                                       0));
-    qdev_connect_gpio_out_named(DEVICE(&ss->gpio), ESP32_GPIO_OUT_GPIO, 13,
-                                qdev_get_gpio_in_named(DEVICE(&ss->spi[3]),
-                                                       ESP32_SPI_EXTERNAL_CS_GPIO,
-                                                       1));
+    if (from_cfg) {
+        int spi_index = ESP32_RADIO_DEFAULT_SPI;
+        int chip_count = cfg->chip_count > 0 ? cfg->chip_count : 1;
+
+        for (int i = 0; i < chip_count && i < 2; i++) {
+            int nss = cfg->chips[i].nss;
+            if (nss < 0 || nss >= ESP32_GPIO_PIN_COUNT) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "ESP32 radio NSS: chip[%d] has no valid nss "
+                              "pin (got %d); skipping CS wiring\n",
+                              i, nss);
+                continue;
+            }
+            qdev_connect_gpio_out_named(DEVICE(&ss->gpio),
+                                        ESP32_GPIO_OUT_GPIO, nss,
+                                        qdev_get_gpio_in_named(
+                                            DEVICE(&ss->spi[spi_index]),
+                                            ESP32_SPI_EXTERNAL_CS_GPIO, i));
+            qemu_log("ESP32 radio NSS: gpio=%d -> SPI%d external-cs[%d]\n",
+                     nss, spi_index, i);
+        }
+    } else {
+        /* Smoke-test legacy wiring: GPIO27/13 -> SPI3 external-cs[0/1]. */
+        qdev_connect_gpio_out_named(DEVICE(&ss->gpio), ESP32_GPIO_OUT_GPIO, 27,
+                                    qdev_get_gpio_in_named(DEVICE(&ss->spi[3]),
+                                                           ESP32_SPI_EXTERNAL_CS_GPIO,
+                                                           0));
+        qdev_connect_gpio_out_named(DEVICE(&ss->gpio), ESP32_GPIO_OUT_GPIO, 13,
+                                    qdev_get_gpio_in_named(DEVICE(&ss->spi[3]),
+                                                           ESP32_SPI_EXTERNAL_CS_GPIO,
+                                                           1));
+    }
 
     qemu_log_mask(LOG_GUEST_ERROR,
-                  "ESP32: fake %s attached to SPI2/SPI3 CS0/CS1; "
-                  "GPIO27/GPIO13 gate SPI3 CS0/CS1; %s->GPIO26\n",
-                  display_name, irq_pin_label);
+                  "ESP32: fake %s attached to SPI%s; %s\n",
+                  display_name,
+                  from_cfg ? "3" : "2/SPI3 CS0/CS1",
+                  from_cfg
+                      ? "NSS wired from radio-config"
+                      : "GPIO27/GPIO13 gate SPI3 CS0/CS1; DIO->GPIO26");
 }
 
 static void esp32_machine_init_i2c(Esp32SocState *s)
@@ -904,6 +1066,25 @@ static void esp32_machine_init(MachineState *machine)
     Esp32MachineState *ms = ESP32_MACHINE(machine);
     esp_radio_config_log("ESP32", ms->radio_config);
     esp_radio_chip_log("ESP32", ms->radio_chip);
+
+    EspRadioBoardConfig radio_cfg;
+    esp_radio_board_config_init(&radio_cfg);
+    if (ms->radio_config) {
+        Error *err = NULL;
+        if (!esp_radio_board_config_load(ms->radio_config, &radio_cfg, &err)) {
+            error_report_err(err);
+            exit(1);
+        }
+        qemu_log("ESP32 radio board: type=%s chips=%d nss=%d busy=%d "
+                 "dio1=%d miso=%d mosi=%d sck=%d\n",
+                 esp_radio_type_str(radio_cfg.type),
+                 radio_cfg.chip_count,
+                 radio_cfg.chips[0].nss,
+                 radio_cfg.chips[0].busy,
+                 radio_cfg.chips[0].dio1,
+                 radio_cfg.miso, radio_cfg.mosi, radio_cfg.sck);
+    }
+
     object_initialize_child(OBJECT(ms), "soc", &ms->esp32, TYPE_ESP32_SOC);
     Esp32SocState *ss = ESP32_SOC(&ms->esp32);
 
@@ -927,7 +1108,7 @@ static void esp32_machine_init(MachineState *machine)
         esp32_machine_init_psram(ss, (uint32_t) (machine->ram_size / MiB));
     }
 
-    esp32_machine_init_radios(ss, ms->radio_chip, ms->radio_air_chardev);
+    esp32_machine_init_radios(ss, &radio_cfg, ms->radio_chip, ms->radio_air_chardev);
 
     esp32_machine_init_i2c(ss);
 

@@ -33,6 +33,13 @@ config XTENSA_ESP32
     select LED
     select ESP_RGB
 
+config XTENSA_ESP8266
+    bool
+    default y
+    depends on XTENSA
+    select SSI
+    select UNIMP
+
 config XTENSA_ESP32S3
     bool
     default y

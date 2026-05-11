@@ -494,7 +494,9 @@ static void lr1121_log_tx_payload(LR1121State *s)
         .freq_hz = s->rf_freq_hz,
         .packet_type = s->packet_type == 0x02 ? "lora" : "fsk",
         .payload_len = s->tx_payload_len,
+        .sync_word_len = 1,
     };
+    f.sync_word[0] = s->lora_syncword;
     memcpy(f.payload, s->buf, MIN(s->tx_payload_len, sizeof(f.payload)));
 
     GString *js = g_string_new("");
@@ -1003,7 +1005,7 @@ static void lr1121_realize(SSIPeripheral *ss, Error **errp)
     LR1121State *s = LR1121(ss);
 
     if (!s->radio_id) {
-        s->radio_id = g_strdup_printf("lr1121-%d", s->parent_obj.cs_index);
+        s->radio_id = g_strdup_printf("lr1121-spi%d-cs%d", s->spi_id, s->parent_obj.cs_index);
     }
 
     semtech_air_bus_init(&s->air_bus, lr1121_rx_cb, s);
@@ -1046,8 +1048,9 @@ static void lr1121_instance_init(Object *obj)
 {
     LR1121State *s = LR1121(obj);
 
-    qdev_init_gpio_out(DEVICE(s), s->dio, LR1121_DIO_COUNT);
-    qdev_init_gpio_out_named(DEVICE(s), &s->busy, "busy", 1);
+    qdev_init_gpio_out_named(DEVICE(s), s->dio,
+                             LR1121_DIO_GPIO, LR1121_DIO_COUNT);
+    qdev_init_gpio_out_named(DEVICE(s), &s->busy, LR1121_BUSY_GPIO, 1);
 }
 
 static const TypeInfo lr1121_info = {
