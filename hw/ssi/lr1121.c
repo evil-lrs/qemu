@@ -425,18 +425,64 @@ static int lr1121_set_cs(SSIPeripheral *ss, bool select)
     return 0;
 }
 
+static void lr1121_rx_cb(void *opaque, const SemtechRadioFrame *f)
+{
+    LR1121State *s = opaque;
+    uint8_t mode = (s->status2 >> 1) & 0x07;
+
+    if (mode != LR1121_STAT2_MODE_RX) {
+        return;
+    }
+
+    size_t len = MIN(f->payload_len, sizeof(s->buf));
+    memcpy(s->buf, f->payload, len);
+
+    s->rx_payload_len = len;
+    s->rx_start_offset = 0;
+
+    s->irq_status |= LR1121_IRQ_RX_DONE;
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "LR1121[%s]: RX injected len=%zu rssi=%d snr=%d\n",
+                  s->radio_id, len, f->rssi_dbm, f->snr_db);
+
+    lr1121_update_irq(s);
+}
+
+static void lr1121_send_hello(LR1121State *s)
+{
+    SemtechRadioFrame f = {
+        .chip = "lr1121",
+        .radio_id = s->radio_id,
+    };
+    GString *out = g_string_new("");
+    semtech_frame_to_hello_json(&f, out);
+    if (semtech_air_bus_send_json(&s->air_bus, out->str)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "LR1121[%s]: sent hello to air-bus\n", s->radio_id);
+    }
+    g_string_free(out, true);
+}
+
 static void lr1121_send_state(LR1121State *s)
 {
+    uint8_t mode = (s->status2 >> 1) & 0x07;
+    bool rx_enabled = (mode == LR1121_STAT2_MODE_RX);
+
     SemtechRadioFrame f = {
         .chip = "lr1121",
         .radio_id = s->radio_id,
         .freq_hz = s->rf_freq_hz,
         .packet_type = s->packet_type == 0x02 ? "lora" : "fsk",
+        .sync_word_len = 1,
     };
+    f.sync_word[0] = s->lora_syncword;
 
     GString *out = g_string_new("");
-    semtech_frame_to_state_json(&f, true, out);
-    semtech_air_bus_send_json(&s->air_bus, out->str);
+    semtech_frame_to_state_json(&f, rx_enabled, out);
+    if (semtech_air_bus_send_json(&s->air_bus, out->str)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "LR1121[%s]: sent state to air-bus (rx=%d freq=%u)\n",
+                      s->radio_id, rx_enabled, s->rf_freq_hz);
+    }
     g_string_free(out, true);
 }
 
@@ -577,6 +623,11 @@ static void lr1121_complete_opcode(LR1121State *s)
         s->read_len = s->param_buf[4] * 4;
         break;
 
+    case LR1121_OP_READ_BUFFER8:
+        s->buf_addr = s->param_buf[0];
+        s->read_len = s->param_buf[1];
+        break;
+
     case LR1121_OP_WRITE_REG_MEM32:
         s->mem_addr =
             ((uint32_t)s->param_buf[0] << 24) |
@@ -619,29 +670,35 @@ static void lr1121_complete_opcode(LR1121State *s)
     case LR1121_OP_SET_STANDBY:
         s->status2 = (s->status2 & 0xF1) | (s->param_buf[0] == 0x00 ?
             (LR1121_STAT2_MODE_STDBY_RC << 1) : (LR1121_STAT2_MODE_STDBY_XOSC << 1));
+        lr1121_send_state(s);
         break;
 
     case LR1121_OP_SET_FS:
         s->status2 = (s->status2 & 0xF1) | (LR1121_STAT2_MODE_FS << 1);
+        lr1121_send_state(s);
         break;
 
     case LR1121_OP_SET_TX:
         lr1121_log_tx_payload(s);
         s->irq_status |= LR1121_IRQ_TX_DONE;
         s->status2 = (s->status2 & 0xF1) | (LR1121_STAT2_MODE_TX << 1);
+        lr1121_send_state(s);
         break;
 
     case LR1121_OP_SET_RX:
         s->status2 = (s->status2 & 0xF1) | (LR1121_STAT2_MODE_RX << 1);
+        lr1121_send_state(s);
         break;
 
     case LR1121_OP_SET_LORA_PUBLIC_NET:
         s->lora_public_network = s->param_buf[0];
         s->lora_syncword = s->lora_public_network ? 0x34 : 0x12;
+        lr1121_send_state(s);
         break;
 
     case LR1121_OP_SET_LORA_SYNC_WORD:
         s->lora_syncword = s->param_buf[0];
+        lr1121_send_state(s);
         break;
 
     case LR1121_OP_SET_GFSK_SYNC_WORD:
@@ -949,8 +1006,10 @@ static void lr1121_realize(SSIPeripheral *ss, Error **errp)
         s->radio_id = g_strdup_printf("lr1121-%d", s->parent_obj.cs_index);
     }
 
-    semtech_air_bus_init(&s->air_bus, NULL, s);
+    semtech_air_bus_init(&s->air_bus, lr1121_rx_cb, s);
     semtech_air_bus_start(&s->air_bus);
+    lr1121_send_hello(s);
+    lr1121_send_state(s);
 
     lr1121_load_defaults(s);
 }
