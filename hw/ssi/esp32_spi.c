@@ -45,7 +45,7 @@ static void esp32_spi_do_command(Esp32SpiState* state, uint32_t cmd_reg);
 
 static bool esp32_spi_debug(Esp32SpiState *s)
 {
-    return s->id == 2 || s->id == 3;
+    return s->id >= 1;
 }
 
 static const char *esp32_spi_reg_name(hwaddr addr)
@@ -234,7 +234,9 @@ static void esp32_spi_write(void *opaque, hwaddr addr,
         s->pin_reg = value;
         break;
     case A_SPI_CMD:
-        fprintf(stderr, "ESP32_SPI%d: CMD write 0x%08x\n", s->id, (uint32_t)value);
+        if (esp32_spi_debug(s)) {
+            fprintf(stderr, "ESP32_SPI%d: CMD write 0x%08x\n", s->id, (uint32_t)value);
+        }
         s->cmd_reg = value;
         esp32_spi_do_command(s, value);
         break;
@@ -411,6 +413,20 @@ static void esp32_spi_do_command(Esp32SpiState* s, uint32_t cmd_reg)
         t.cmd_bytes = 1;
         t.addr_bytes = bitlen_to_bytes(FIELD_EX32(s->user1_reg, SPI_USER1, ADDR_BITLEN));
         t.addr = s->addr_reg;
+        /* SPI Flash (SPI1) expects addresses MSB-first.
+         * Reverse only when the driver is reading. */
+        if (s->id == 1) {
+            if (t.addr_bytes == 3) {
+                t.addr = ((s->addr_reg & 0x0000ff) << 16) |
+                         (s->addr_reg & 0x00ff00) |
+                         ((s->addr_reg & 0xff0000) >> 16);
+            } else if (t.addr_bytes == 4) {
+                t.addr = ((s->addr_reg & 0x000000ff) << 24) |
+                         ((s->addr_reg & 0x0000ff00) << 8) |
+                         ((s->addr_reg & 0x00ff0000) >> 8) |
+                         ((s->addr_reg & 0xff000000) >> 24);
+            }
+        }
         t.data = &s->data_reg[0];
         t.data_rx_bytes = bitlen_to_bytes(s->miso_dlen_reg);
         break;

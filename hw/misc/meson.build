@@ -146,7 +146,8 @@ system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files(
   'esp32_ledc.c',
   'esp32_flash_enc.c',
   'ssi_psram.c',
-  'esp_radio_board.c'
+  'esp_radio_board.c',
+  'esp32_wifi_stub.c'
 ))
 
 system_ss.add(when: 'CONFIG_RISCV_ESP32C3', if_true: files(
