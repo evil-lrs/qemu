@@ -93,7 +93,6 @@ struct Esp32C3MachineState {
     ESPRgbState rgb;
     Esp32C3TWAIState twai;
     char *radio_config;
-    char *radio_chip;
     char *radio_air_chardev;
 };
 
@@ -346,7 +345,6 @@ static void esp32c3_machine_init(MachineState *machine)
     /* Re-use the macro that checks and casts any generic/parent class to the real child instance */
     Esp32C3MachineState *ms = ESP32C3_MACHINE(machine);
     esp_radio_config_log("ESP32-C3", ms->radio_config);
-    esp_radio_chip_log("ESP32-C3", ms->radio_chip);
 
     EspRadioBoardConfig radio_cfg;
     esp_radio_board_config_init(&radio_cfg);

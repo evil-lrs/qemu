@@ -24,6 +24,7 @@ void esp_radio_board_config_init(EspRadioBoardConfig *cfg)
 {
     g_assert(cfg);
     cfg->type = ESP_RADIO_NONE;
+    cfg->spi_bus = -1;
     cfg->miso = -1;
     cfg->mosi = -1;
     cfg->sck  = -1;
@@ -41,6 +42,12 @@ void esp_radio_board_config_init(EspRadioBoardConfig *cfg)
     cfg->rfsw_ctrl_len = 0;
     for (int i = 0; i < 8; i++) {
         cfg->rfsw_ctrl[i] = 0;
+    }
+    cfg->i2c_device_count = 0;
+    for (int i = 0; i < ESP_BOARD_I2C_MAX; i++) {
+        cfg->i2c_devices[i].type[0] = '\0';
+        cfg->i2c_devices[i].address = -1;
+        cfg->i2c_devices[i].temperature_milli_c = INT_MIN;
     }
 }
 
@@ -122,6 +129,141 @@ static bool try_get_bool(const QDict *d, const char *key, bool *out)
         return false;
     }
     *out = qbool_get_bool(b);
+    return true;
+}
+
+static bool parse_spi_bus(const QDict *d, EspRadioBoardConfig *cfg,
+                          Error **errp)
+{
+    if (!qdict_haskey(d, "radio_spi")) {
+        return true;
+    }
+    QObject *obj = qdict_get(d, "radio_spi");
+
+    QNum *n = qobject_to(QNum, obj);
+    if (n) {
+        int64_t v;
+        if (!qnum_get_try_int(n, &v)) {
+            error_setg(errp, "radio_spi: not an integer");
+            return false;
+        }
+        if (v != 2 && v != 3) {
+            error_setg(errp,
+                       "radio_spi: %" PRId64 " is not a valid ESP32 SPI bus "
+                       "(use 2 for HSPI or 3 for VSPI)", v);
+            return false;
+        }
+        cfg->spi_bus = (int)v;
+        return true;
+    }
+
+    QString *s = qobject_to(QString, obj);
+    if (s) {
+        const char *str = qstring_get_str(s);
+        if (g_ascii_strcasecmp(str, "spi2") == 0 ||
+            g_ascii_strcasecmp(str, "hspi") == 0) {
+            cfg->spi_bus = 2;
+            return true;
+        }
+        if (g_ascii_strcasecmp(str, "spi3") == 0 ||
+            g_ascii_strcasecmp(str, "vspi") == 0) {
+            cfg->spi_bus = 3;
+            return true;
+        }
+        error_setg(errp,
+                   "radio_spi: '%s' is not recognized (use spi2/hspi or "
+                   "spi3/vspi, or an integer 2 or 3)", str);
+        return false;
+    }
+
+    error_setg(errp, "radio_spi: must be an integer or a string");
+    return false;
+}
+
+static bool parse_i2c_devices(const QDict *d, EspRadioBoardConfig *cfg,
+                              Error **errp)
+{
+    if (!qdict_haskey(d, "i2c")) {
+        return true;
+    }
+    QObject *obj = qdict_get(d, "i2c");
+    QList *list = qobject_to(QList, obj);
+    if (!list) {
+        error_setg(errp, "i2c: must be a JSON array");
+        return false;
+    }
+
+    int i = 0;
+    const QListEntry *e;
+    QLIST_FOREACH_ENTRY(list, e) {
+        if (i >= ESP_BOARD_I2C_MAX) {
+            error_setg(errp,
+                       "i2c: at most %d devices supported",
+                       ESP_BOARD_I2C_MAX);
+            return false;
+        }
+        QDict *item = qobject_to(QDict, qlist_entry_obj(e));
+        if (!item) {
+            error_setg(errp, "i2c[%d]: must be an object", i);
+            return false;
+        }
+
+        const char *type_str = qdict_get_try_str(item, "type");
+        if (!type_str || !*type_str) {
+            error_setg(errp, "i2c[%d]: missing 'type' string", i);
+            return false;
+        }
+        g_strlcpy(cfg->i2c_devices[i].type, type_str,
+                  sizeof(cfg->i2c_devices[i].type));
+
+        QObject *addr_obj = qdict_get(item, "address");
+        if (!addr_obj) {
+            error_setg(errp, "i2c[%d]: missing 'address'", i);
+            return false;
+        }
+        int address = -1;
+        QNum *addr_num = qobject_to(QNum, addr_obj);
+        QString *addr_str = qobject_to(QString, addr_obj);
+        if (addr_num) {
+            int64_t v;
+            if (!qnum_get_try_int(addr_num, &v) || v < 0 || v > 0x7f) {
+                error_setg(errp,
+                           "i2c[%d]: 'address' must be a 7-bit integer", i);
+                return false;
+            }
+            address = (int)v;
+        } else if (addr_str) {
+            const char *as = qstring_get_str(addr_str);
+            char *end = NULL;
+            long v = strtol(as, &end, 0); /* accepts "0x48" or "72" */
+            if (!end || *end != '\0' || v < 0 || v > 0x7f) {
+                error_setg(errp,
+                           "i2c[%d]: 'address' string '%s' is not a valid "
+                           "7-bit I2C address", i, as);
+                return false;
+            }
+            address = (int)v;
+        } else {
+            error_setg(errp,
+                       "i2c[%d]: 'address' must be int or hex string", i);
+            return false;
+        }
+        cfg->i2c_devices[i].address = address;
+
+        if (qdict_haskey(item, "temperature_milli_c")) {
+            QNum *t = qobject_to(QNum, qdict_get(item, "temperature_milli_c"));
+            int64_t v;
+            if (!t || !qnum_get_try_int(t, &v)) {
+                error_setg(errp,
+                           "i2c[%d].temperature_milli_c: not an integer", i);
+                return false;
+            }
+            cfg->i2c_devices[i].temperature_milli_c = (int)v;
+        }
+
+        i++;
+    }
+    cfg->i2c_device_count = i;
     return true;
 }
 
@@ -231,6 +373,18 @@ bool esp_radio_board_config_load(const char *path,
     }
 
     if (!parse_rfsw_ctrl(d, cfg, errp)) {
+        qobject_unref(root);
+        esp_radio_board_config_init(cfg);
+        return false;
+    }
+
+    if (!parse_spi_bus(d, cfg, errp)) {
+        qobject_unref(root);
+        esp_radio_board_config_init(cfg);
+        return false;
+    }
+
+    if (!parse_i2c_devices(d, cfg, errp)) {
         qobject_unref(root);
         esp_radio_board_config_init(cfg);
         return false;

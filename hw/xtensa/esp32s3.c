@@ -321,7 +321,6 @@ struct Esp32s3MachineState {
     Esp32s3SocState esp32s3;
     DeviceState *flash_dev;
     char *radio_config;
-    char *radio_chip;
     char *radio_air_chardev;
 };
 #define TYPE_ESP32S3_MACHINE MACHINE_TYPE_NAME("esp32s3")
@@ -620,7 +619,6 @@ static void esp32s3_machine_init(MachineState *machine)
     MemoryRegion *sys_mem = get_system_memory();
     Esp32s3MachineState *ms = ESP32S3_MACHINE(machine);
     esp_radio_config_log("ESP32-S3", ms->radio_config);
-    esp_radio_chip_log("ESP32-S3", ms->radio_chip);
 
     EspRadioBoardConfig radio_cfg;
     esp_radio_board_config_init(&radio_cfg);

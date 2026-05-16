@@ -20,9 +20,19 @@
 #include "hw/irq.h"
 #include "hw/misc/esp32_wifi_stub.h"
 
+struct WifiStubRegion;
+struct WifiStubOverlay;
+
+typedef uint32_t (*WifiStubReadFn)(struct WifiStubRegion *r, hwaddr off,
+                                   uint32_t stored);
+typedef uint32_t (*WifiStubWriteFn)(struct WifiStubRegion *r, hwaddr off,
+                                    uint32_t value);
+
 typedef struct WifiStubOverlay {
-    hwaddr offset;
-    uint32_t value;
+    hwaddr           offset;
+    uint32_t         value;     /* used when on_read is NULL */
+    WifiStubReadFn   on_read;   /* optional: compute read value from state */
+    WifiStubWriteFn  on_write;  /* optional: transform value before storing */
 } WifiStubOverlay;
 
 typedef struct WifiStubRegion {
@@ -39,6 +49,13 @@ typedef struct WifiStubRegion {
      * registers with reads of the *same* status register and would
      * otherwise re-poll for ever after every write). */
     bool *poll_unlock;
+    /* Echo-loop detector: catches loops where reads alternate with
+     * writes that only change non-control bits, which the spin-reads
+     * detector misses (writes reset spin_reads).  Per-region opt-in. */
+    uint32_t *echo_reads;
+    uint32_t *echo_writes;
+    bool      echo_detect_enabled;
+    uint32_t  echo_latch_value;
     const WifiStubOverlay *overlays;
     size_t overlay_count;
     Esp32WifiEmuMode mode;
@@ -46,6 +63,7 @@ typedef struct WifiStubRegion {
 } WifiStubRegion;
 
 #define WIFI_STUB_POLL_UNLOCK_THRESHOLD 16
+#define WIFI_STUB_ECHO_LOOP_THRESHOLD   64
 
 /* Process-global mode set by `esp32_wifi_stub_set_mode()` before any
  * region is added.  Each region snapshots the value at install time. */
@@ -59,10 +77,28 @@ static const WifiStubOverlay overlays_fe2[] = { };
 static const WifiStubOverlay overlays_rtcio[] = { };
 static const WifiStubOverlay overlays_sens[] = { };
 static const WifiStubOverlay overlays_iomux[] = { };
+
+/* Wi-Fi MAC RX command-consume handler.  Observed firmware behaviour:
+ * `wDev_Init` programs the MAC RX block by writing command words to
+ * 0x3ff4e004 / 0x3ff4e044 (low nibble always `0x7`, bit 0 always SET),
+ * then reading the same offset back 2-3 times waiting for the hardware
+ * to acknowledge the command.  Real silicon clears the strobe bit when
+ * the command is consumed; this stub mimics that by stripping bit 0
+ * from the stored copy so the very next read shows "idle". */
+static uint32_t nrx_cmd_consume(WifiStubRegion *r, hwaddr off, uint32_t v)
+{
+    (void)r; (void)off;
+    return v & ~0x1u;
+}
+
 static const WifiStubOverlay overlays_nrx[] = {
     /* PHY `set_chan_reg` loops while bit 25 of 0x3ff4e000 is SET.
      * Return 0 to satisfy the "wait until bit cleared" condition. */
     { 0x0000, 0x00000000 },
+    /* MAC RX command/strobe registers: clear bit 0 on write so the
+     * firmware sees the command as consumed on its next read. */
+    { 0x0004, 0, NULL, nrx_cmd_consume },
+    { 0x0044, 0, NULL, nrx_cmd_consume },
 };
 static const WifiStubOverlay overlays_apbctrl[] = {
     { 0x0000, 0x00000001 },              /* SYSCLK_CONF: pre_div_cnt=1 */
@@ -99,15 +135,14 @@ static const WifiStubOverlay *lookup_overlay(const char *name,
     return NULL;
 }
 
-static bool overlay_lookup(WifiStubRegion *r, hwaddr offset, uint32_t *out)
+static const WifiStubOverlay *overlay_find(WifiStubRegion *r, hwaddr offset)
 {
     for (size_t i = 0; i < r->overlay_count; i++) {
         if (r->overlays[i].offset == (offset & ~3ULL)) {
-            *out = r->overlays[i].value;
-            return true;
+            return &r->overlays[i];
         }
     }
-    return false;
+    return NULL;
 }
 
 /* ---------- MMIO read / write ops ---------- */
@@ -117,12 +152,25 @@ static uint64_t wifi_stub_read(void *opaque, hwaddr offset, unsigned size)
     WifiStubRegion *r = opaque;
     size_t word = offset >> 2;
     uint32_t word_val = 0;
-    bool from_overlay = overlay_lookup(r, offset, &word_val);
-    bool quiet = false; /* from_overlay; */
+    const WifiStubOverlay *ov = overlay_find(r, offset);
+    bool from_overlay = false;
+    bool quiet = false;
+
+    if (ov && ov->on_read) {
+        uint32_t stored = (word < (r->size >> 2)) ? r->storage[word] : 0;
+        word_val = ov->on_read(r, offset, stored);
+        from_overlay = true;
+    } else if (ov && !ov->on_write) {
+        /* Pure fixed-value overlay (no write side-effect). */
+        word_val = ov->value;
+        from_overlay = true;
+        quiet = false;
+    }
 
     if (!from_overlay && word < (r->size >> 2)) {
         if (r->poll_unlock[word]) {
-            word_val = 0xffffffffu;
+            word_val = r->echo_detect_enabled ? r->echo_latch_value
+                                              : 0xffffffffu;
             quiet = true;
         } else if (r->touched[word]) {
             /* Echo previously-written value. */
@@ -148,6 +196,27 @@ static uint64_t wifi_stub_read(void *opaque, hwaddr offset, unsigned size)
             word_val = r->default_val;
             quiet = true;
         }
+
+        if (r->echo_detect_enabled && !r->poll_unlock[word]) {
+            r->echo_reads[word]++;
+            uint32_t total = r->echo_reads[word] + r->echo_writes[word];
+            if (total >= WIFI_STUB_ECHO_LOOP_THRESHOLD &&
+                r->echo_reads[word] * 2 >= total) {
+                r->poll_unlock[word] = true;
+                word_val = r->echo_latch_value;
+                quiet = true;
+                qemu_log_mask(LOG_UNIMP,
+                              "%s: stub echo-loop unlock at offset=0x%04"
+                              HWADDR_PRIx " (latched to 0x%08x)\n",
+                              r->name, offset & ~3ULL,
+                              r->echo_latch_value);
+            }
+        }
+    } else if (from_overlay && r->echo_detect_enabled
+               && word < (r->size >> 2)) {
+        /* Even handler-owned offsets count toward the loop heuristic,
+         * but only for logging — the handler already supplies a value. */
+        r->echo_reads[word]++;
     }
 
     uint64_t val;
@@ -184,6 +253,12 @@ static void wifi_stub_write(void *opaque, hwaddr offset, uint64_t value,
         uint32_t mask = ((1ULL << (size << 3)) - 1) << shift;
         cur = (cur & ~mask) | (((uint32_t)value << shift) & mask);
     }
+
+    const WifiStubOverlay *ov = overlay_find(r, offset);
+    if (ov && ov->on_write) {
+        cur = ov->on_write(r, offset, cur);
+    }
+
     r->storage[word] = cur;
     r->touched[word] = true;
     /* Writes reset the spin counter so a *fresh* polling cycle has to
@@ -191,10 +266,35 @@ static void wifi_stub_write(void *opaque, hwaddr offset, uint64_t value,
      * we decide an offset is a status register, keep it latched. */
     r->spin_reads[word] = 0;
 
-    qemu_log_mask(LOG_UNIMP,
-                  "%s: stub write size=%u offset=0x%04" HWADDR_PRIx
-                  " value=0x%" PRIx64 "\n",
-                  r->name, size, offset, value);
+    bool quiet = false;
+    if (r->echo_detect_enabled) {
+        if (r->poll_unlock[word]) {
+            /* Already latched: stay quiet on subsequent writes too so a
+             * write-only "strobe" loop on this offset doesn't flood the
+             * log after the read-side has been silenced. */
+            quiet = true;
+        } else {
+            r->echo_writes[word]++;
+            uint32_t total = r->echo_reads[word] + r->echo_writes[word];
+            if (total >= WIFI_STUB_ECHO_LOOP_THRESHOLD
+                && r->echo_reads[word] * 2 >= total) {
+                r->poll_unlock[word] = true;
+                qemu_log_mask(LOG_UNIMP,
+                              "%s: stub echo-loop unlock at offset=0x%04"
+                              HWADDR_PRIx " (latched to 0x%08x)\n",
+                              r->name, offset & ~3ULL,
+                              r->echo_latch_value);
+                quiet = true;
+            }
+        }
+    }
+
+    if (!quiet) {
+        qemu_log_mask(LOG_UNIMP,
+                      "%s: stub write size=%u offset=0x%04" HWADDR_PRIx
+                      " value=0x%" PRIx64 "\n",
+                      r->name, size, offset, value);
+    }
 }
 
 static const MemoryRegionOps wifi_stub_ops = {
@@ -340,6 +440,10 @@ void esp32_wifi_stub_add_region(const char *name, hwaddr dport_base,
     r->touched = g_new0(bool, size >> 2);
     r->spin_reads = g_new0(uint32_t, size >> 2);
     r->poll_unlock = g_new0(bool, size >> 2);
+    r->echo_reads = g_new0(uint32_t, size >> 2);
+    r->echo_writes = g_new0(uint32_t, size >> 2);
+    r->echo_detect_enabled = g_str_equal(name, "esp32.nrx");
+    r->echo_latch_value = r->echo_detect_enabled ? 0u : 0xffffffffu;
     r->overlays = lookup_overlay(r->name, &r->overlay_count);
     r->mode = g_wifi_stub_mode;
     r->default_val = default_val;

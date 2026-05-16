@@ -28,8 +28,23 @@ typedef struct EspRadioChipConfig {
     int dio2;
 } EspRadioChipConfig;
 
+#define ESP_BOARD_I2C_MAX 4
+
+typedef struct EspI2cDeviceConfig {
+    char type[24];
+    int  address;
+    /* tmp105 init temperature in millidegrees Celsius; INT_MIN means unset. */
+    int  temperature_milli_c;
+} EspI2cDeviceConfig;
+
 typedef struct EspRadioBoardConfig {
     EspRadioType type;
+
+    /* SPI controller index the radio is wired to (typically 2=HSPI or
+     * 3=VSPI on ESP32). -1 means "not specified"; the machine should treat
+     * that as "no radio attached".
+     */
+    int spi_bus;
 
     int miso;
     int mosi;
@@ -42,6 +57,9 @@ typedef struct EspRadioBoardConfig {
     bool radio_rfo_hf;
     int  rfsw_ctrl[8];
     int  rfsw_ctrl_len;
+
+    int  i2c_device_count;
+    EspI2cDeviceConfig i2c_devices[ESP_BOARD_I2C_MAX];
 } EspRadioBoardConfig;
 
 void esp_radio_board_config_init(EspRadioBoardConfig *cfg);
