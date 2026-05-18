@@ -523,48 +523,55 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     esp32_soc_add_periph_device(sys_mem, &s->rgb, DR_REG_FRAMEBUF_BASE);
     memory_region_add_subregion_overlap(sys_mem, esp32_memmap[ESP32_MEMREGION_FRAMEBUF].base, &s->rgb.vram, 0);
 
-    /* Wi-Fi / PHY peripherals: use a stateful stub so writes echo back on
-     * read and the PHY/BB/FE calibration polls during `esp_wifi_init()`
-     * can complete.  The plain `create_unimplemented_device` would return
-     * zero forever and stall the firmware.  Each call maps both the DPORT
-     * view (`base`) and the APB mirror (`base - DPORT_APB + APB_REG_BASE`),
-     * matching `esp32_soc_add_unimp_device()`. */
+    /* Wi-Fi MAC + PHY emulation: vendored from lcgamboa.  The MAC
+     * (esp32_wifi) needs a NIC backend; PHY-A (esp32_phya) and
+     * front-end (esp32_fe) are unconditional.  Surrounding regions
+     * (fe2/nrx/bb/chipv7_phy/chipv7_phyb) plus the non-PHY peripheral
+     * stubs (analog/rtcio/sens/iomux/apbctrl/i2s0/i2s1/rmt/pcnt/mcpwm)
+     * keep a plain stateful backing via esp32_wifi_stub. */
+    qdev_realize(DEVICE(&s->fe), &s->periph_bus, &error_fatal);
+    esp32_soc_add_periph_device(sys_mem, &s->fe, DR_REG_FE_BASE);
+
+    qdev_realize(DEVICE(&s->phya), &s->periph_bus, &error_fatal);
+    esp32_soc_add_periph_device(sys_mem, &s->phya, DR_REG_PHYA_BASE);
+
+    qdev_realize(DEVICE(&s->ana), &s->periph_bus, &error_fatal);
+    esp32_soc_add_periph_device(sys_mem, &s->ana, DR_REG_ANA_BASE);
+
+    NICInfo *wifi_nd = qemu_find_nic_info(TYPE_ESP32_WIFI, false, NULL);
+    if (wifi_nd != NULL) {
+        qdev_set_nic_properties(DEVICE(&s->wifi), wifi_nd);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(&s->wifi), &error_fatal);
+        esp32_soc_add_periph_device(sys_mem, &s->wifi, DR_REG_WIFI_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->wifi), 0,
+            qdev_get_gpio_in(intmatrix_dev, ETS_WIFI_MAC_INTR_SOURCE));
+    }
+
 #define ESP32_WIFI_STUB(name_, base_, size_, default_) \
     esp32_wifi_stub_add_region((name_), (base_), \
                                (base_) - DR_REG_DPORT_APB_BASE + APB_REG_BASE, \
                                (size_), (default_))
-    ESP32_WIFI_STUB("esp32.analog",  DR_REG_ANA_BASE,     0x1000, 0xffffffff);
-    ESP32_WIFI_STUB("esp32.rtcio",   DR_REG_RTCIO_BASE,   0x400,  0xffffffff);
-    ESP32_WIFI_STUB("esp32.sens",    DR_REG_SENS_BASE,    0x400,  0xffffffff);
-    ESP32_WIFI_STUB("esp32.iomux",   DR_REG_IO_MUX_BASE,  0x2000, 0xffffffff);
-    /* 0x3ff5c000-0x3ff5cfff: NRX + part of WiFi MAC (label kept as "bb"
-     * to match the legacy comment). 0x3ff5d000+: real BB.  Both need
-     * stubbing — without 0x3ff5d000 the firmware takes a PIFAddrError
-     * during PHY init. */
-    /* On ESP32, the Wi-Fi MAC's host-visible register set actually
-     * lives inside the BB/NRX ranges (0x3ff5c000-0x3ff5dfff) above,
-     * not at a separate base.  The PHY status registers live in the
-     * analog/fe/fe2 ranges, also above.  Nothing else needs a
-     * dedicated WiFi-MAC stub region — the BB stub covers it. */
-    ESP32_WIFI_STUB("esp32.bb",      0x3ff5c000,          0x2000, 0xffffffff);
-    ESP32_WIFI_STUB("esp32.fe",      0x3ff45000,          0x1000, 0x00000000);
-    ESP32_WIFI_STUB("esp32.fe2",     0x3ff46000,          0x1000, 0x00000000);
-    ESP32_WIFI_STUB("esp32.nrx",     0x3ff4e000,          0x1000, 0x00000000);
-    /* apbctrl/syscon handles clock gating and system tick configuration.
-     * Route it through the stateful stub to avoid logging spam. */
-    ESP32_WIFI_STUB("esp32.apbctrl", DR_REG_APB_CTRL_BASE, 0x1000, 0x00000000);
+    ESP32_WIFI_STUB("esp32.rtcio",       DR_REG_RTCIO_BASE,   0x400,  0xffffffff);
+    ESP32_WIFI_STUB("esp32.sens",        DR_REG_SENS_BASE,    0x400,  0xffffffff);
+    ESP32_WIFI_STUB("esp32.iomux",       DR_REG_IO_MUX_BASE,  0x2000, 0xffffffff);
+    /* fe2/nrx/bb/chipv7_phy/chipv7_phyb mirror lcgamboa's
+     * create_unimplemented_device_default_value(-1) stubs. */
+    ESP32_WIFI_STUB("esp32.fe2",         DR_REG_FE2_BASE,     0x1000, 0xffffffff);
+    ESP32_WIFI_STUB("esp32.nrx",         0x3ff4e000,          0x1000, 0xffffffff);
+    ESP32_WIFI_STUB("esp32.bb",          0x3ff5c000,          0x2000, 0xffffffff);
+    ESP32_WIFI_STUB("esp32.chipv7_phy",  0x3ff71000,          0x1000, 0xffffffff);
+    ESP32_WIFI_STUB("esp32.chipv7_phyb", DR_REG_WDEV_BASE,    0x1000, 0x00000000);
+    ESP32_WIFI_STUB("esp32.apbctrl",     DR_REG_APB_CTRL_BASE, 0x1000, 0x00000000);
 #undef ESP32_WIFI_STUB
 
-    /* (The opt-in WiFi IRQ pulser is armed from `esp32_machine_init`
-     * after the SoC is realized, when Esp32MachineState is in scope.) */
     esp32_soc_add_unimp_device(sys_mem, "esp32.hinf", DR_REG_HINF_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.slc", DR_REG_SLC_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.slchost", DR_REG_SLCHOST_BASE, 0x1000);
     /* i2s0/i2s1/rmt/pcnt/mcpwm participate in IDF clock/peripheral init
      * (i2s0 is used by IDF as the PHY reference-clock source) and get
      * polled for status bits the same way as the BB/FE regions.  Route
-     * them through the stateful wifi-stub so dummy-mode unblocks any
-     * "wait for ready" loops without us having to enumerate each bit. */
+     * them through the stateful wifi-stub so any "wait for ready"
+     * loops unblock without us enumerating each bit. */
 #define ESP32_WIFI_STUB(name_, base_, size_, default_) \
     esp32_wifi_stub_add_region((name_), (base_), \
                                (base_) - DR_REG_DPORT_APB_BASE + APB_REG_BASE, \
@@ -669,6 +676,13 @@ static void esp32_soc_init(Object *obj)
 
     object_initialize_child(obj, "efuse", &s->efuse, TYPE_ESP32_EFUSE);
 
+    if (qemu_find_nic_info(TYPE_ESP32_WIFI, false, NULL) != NULL) {
+        object_initialize_child(obj, "wifi", &s->wifi, TYPE_ESP32_WIFI);
+    }
+    object_initialize_child(obj, "fe", &s->fe, TYPE_ESP32_FE);
+    object_initialize_child(obj, "phya", &s->phya, TYPE_ESP32_PHYA);
+    object_initialize_child(obj, "ana", &s->ana, TYPE_ESP32_ANA);
+
     object_initialize_child(obj, "flash_enc", &s->flash_enc, TYPE_ESP32_FLASH_ENCRYPTION);
 
     object_initialize_child(obj, "sdmmc", &s->sdmmc, TYPE_DWC_SDMMC);
@@ -726,9 +740,6 @@ struct Esp32MachineState {
     DeviceState *flash_dev;
     char *radio_config;
     char *radio_air_chardev;
-    /* `wifi-emulation=` string property. NULL or empty → DUMMY (the
-     * default). See esp32_wifi_stub.h for the enum semantics. */
-    char *wifi_emulation;
 };
 #define TYPE_ESP32_MACHINE MACHINE_TYPE_NAME("esp32")
 
@@ -1047,30 +1058,6 @@ static void esp32_machine_init(MachineState *machine)
     Esp32MachineState *ms = ESP32_MACHINE(machine);
     esp_radio_config_log("ESP32", ms->radio_config);
 
-    /* Snapshot the wifi-emulation mode *before* the SoC realizes,
-     * because the wifi-stub regions are installed inside
-     * esp32_soc_realize() and read the global mode at install time.
-     *
-     * The stateful stub regions are always active (they're a strict
-     * improvement over `create_unimplemented_device` returning zero
-     * forever).  The active *strategy* is what `wifi-emulation`
-     * controls.  When the user did not pass the flag at all
-     * (`ms->wifi_emulation` is NULL) we use DUMMY semantics for the
-     * regions but skip the IRQ pulser — the pulser interferes with
-     * firmware that doesn't expect spurious Wi-Fi interrupts (e.g.
-     * the SX127x smoke test). */
-    {
-        bool unknown = false;
-        Esp32WifiEmuMode mode = esp32_wifi_stub_parse_mode(ms->wifi_emulation,
-                                                           &unknown);
-        if (unknown) {
-            /* Setter already rejected it; reaching here means the
-             * machine option was empty/NULL.  Defensive default. */
-            mode = ESP32_WIFI_EMU_DUMMY;
-        }
-        esp32_wifi_stub_set_mode(mode);
-    }
-
     EspRadioBoardConfig radio_cfg;
     esp_radio_board_config_init(&radio_cfg);
     if (ms->radio_config) {
@@ -1103,19 +1090,6 @@ static void esp32_machine_init(MachineState *machine)
     }
 
     qdev_realize(DEVICE(ss), NULL, &error_fatal);
-
-    /* Opt-in WiFi IRQ pulser: only armed when the user explicitly
-     * passed `wifi-emulation=` on the command line.  Required for
-     * firmware that actually waits for Wi-Fi events; harmful for
-     * firmware that doesn't, because the spurious pulses can run
-     * real ISR handlers in unexpected states. */
-    if (ms->wifi_emulation && *ms->wifi_emulation) {
-        DeviceState *intmat = DEVICE(&ss->intmatrix);
-        esp32_wifi_stub_start_event_pulser(
-            qdev_get_gpio_in(intmat, ETS_WIFI_MAC_INTR_SOURCE),
-            qdev_get_gpio_in(intmat, ETS_WIFI_BB_INTR_SOURCE),
-            100);
-    }
 
     if (blk) {
         esp32_machine_init_spi_flash(ss, blk);
@@ -1224,29 +1198,6 @@ static ram_addr_t esp32_fixup_ram_size(ram_addr_t requested_size)
 
 ESP_RADIO_OPTIONS_DEFINE_ACCESSORS(esp32_machine, Esp32MachineState, ESP32_MACHINE)
 
-static char *esp32_machine_get_wifi_emulation(Object *obj, Error **errp)
-{
-    Esp32MachineState *ms = ESP32_MACHINE(obj);
-    return g_strdup(ms->wifi_emulation);
-}
-
-static void esp32_machine_set_wifi_emulation(Object *obj, const char *value,
-                                             Error **errp)
-{
-    Esp32MachineState *ms = ESP32_MACHINE(obj);
-    bool unknown = false;
-    (void)esp32_wifi_stub_parse_mode(value, &unknown);
-    if (unknown) {
-        error_setg(errp,
-                   "wifi-emulation: unknown value '%s' "
-                   "(expected: dummy | network)",
-                   value);
-        return;
-    }
-    g_free(ms->wifi_emulation);
-    ms->wifi_emulation = g_strdup(value);
-}
-
 /* Initialize machine type */
 static void esp32_machine_class_init(ObjectClass *oc, void *data)
 {
@@ -1259,17 +1210,6 @@ static void esp32_machine_class_init(ObjectClass *oc, void *data)
     mc->fixup_ram_size = esp32_fixup_ram_size;
 
     ESP_RADIO_OPTIONS_ADD_PROPS(oc, esp32_machine);
-
-    object_class_property_add_str(oc, "wifi-emulation",
-        esp32_machine_get_wifi_emulation,
-        esp32_machine_set_wifi_emulation);
-    object_class_property_set_description(oc, "wifi-emulation",
-        "Wi-Fi emulation strategy. "
-        "'dummy' (default): satisfy esp_wifi_init / PHY calibration "
-        "via stateful stubs so the firmware can progress past Wi-Fi "
-        "setup to reach radio init. "
-        "'network': reserved for a future real-network backend (not "
-        "implemented; currently behaves like dummy with a warning).");
 }
 
 static const TypeInfo esp32_info = {

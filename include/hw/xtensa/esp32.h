@@ -24,6 +24,10 @@
 #include "hw/net/can/esp32_twai.h"
 #include "hw/sd/dwc_sdmmc.h"
 #include "hw/display/esp_rgb.h"
+#include "hw/misc/esp32_wifi.h"
+#include "hw/misc/esp32_fe.h"
+#include "hw/misc/esp32_phya.h"
+#include "hw/misc/esp32_ana.h"
 
 typedef struct Esp32SocState {
     /*< private >*/
@@ -48,6 +52,10 @@ typedef struct Esp32SocState {
     Esp32RsaState rsa;
     Esp32LEDCState ledc;
     Esp32EfuseState efuse;
+    Esp32WifiState wifi;
+    Esp32FeState fe;
+    Esp32PhyaState phya;
+    Esp32AnaState ana;
     Esp32FlashEncryptionState flash_enc;
     ESPRgbState rgb;
 
