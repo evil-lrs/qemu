@@ -18,3 +18,17 @@
 void esp32_wifi_stub_add_region(const char *name, hwaddr dport_base,
                                 hwaddr apb_base, size_t size,
                                 uint32_t default_val);
+
+/*
+ * Same as esp32_wifi_stub_add_region(), but bits set in @self_clear_mask
+ * are forced to zero in storage on every write.  Used to model "busy"
+ * / "trigger" status bits that the real hardware self-clears once a
+ * transaction completes — e.g. NRX bit 25 driven by libphy's
+ * i2c_master_reset() loop.  Reads otherwise behave the same as the
+ * plain stub: stored value for touched words, @default_val otherwise.
+ */
+void esp32_wifi_stub_add_region_self_clear(const char *name,
+                                           hwaddr dport_base,
+                                           hwaddr apb_base, size_t size,
+                                           uint32_t default_val,
+                                           uint32_t self_clear_mask);

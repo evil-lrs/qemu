@@ -28,6 +28,8 @@
 #include "hw/misc/esp32_fe.h"
 #include "hw/misc/esp32_phya.h"
 #include "hw/misc/esp32_ana.h"
+#include "hw/misc/esp32_iomux.h"
+#include "hw/misc/esp32_sens.h"
 
 typedef struct Esp32SocState {
     /*< private >*/
@@ -56,6 +58,8 @@ typedef struct Esp32SocState {
     Esp32FeState fe;
     Esp32PhyaState phya;
     Esp32AnaState ana;
+    Esp32IomuxState iomux;
+    Esp32SensState sens;
     Esp32FlashEncryptionState flash_enc;
     ESPRgbState rgb;
 

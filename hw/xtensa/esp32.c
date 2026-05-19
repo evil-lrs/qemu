@@ -253,12 +253,18 @@ static void esp32_clk_update(void* opaque, int n, int level)
 
 static void esp32_soc_add_periph_device(MemoryRegion *dest, void* dev, hwaddr dport_base_addr)
 {
+    /* Priority 1: proper qdev devices (esp32_wifi, esp32_phya, esp32_fe,
+     * esp32_ana, esp32_iomux, esp32_sens, sdmmc, rgb, ...) must take
+     * precedence over the priority-0 wifi_stub catch-all regions
+     * (esp32.mcpwm at 0x3ff70000+0x8000 overlaps WiFi MAC,
+     * PHYA, WDEV, chipv7_phy; without higher priority the qdev
+     * devices were silently shadowed). */
     MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 0);
-    memory_region_add_subregion_overlap(dest, dport_base_addr, mr, 0);
+    memory_region_add_subregion_overlap(dest, dport_base_addr, mr, 1);
     MemoryRegion *mr_apb = g_new(MemoryRegion, 1);
     char *name = g_strdup_printf("mr-apb-0x%08x", (uint32_t) dport_base_addr);
     memory_region_init_alias(mr_apb, OBJECT(dev), name, mr, 0, memory_region_size(mr));
-    memory_region_add_subregion_overlap(dest, dport_base_addr - DR_REG_DPORT_APB_BASE + APB_REG_BASE, mr_apb, 0);
+    memory_region_add_subregion_overlap(dest, dport_base_addr - DR_REG_DPORT_APB_BASE + APB_REG_BASE, mr_apb, 1);
     g_free(name);
 }
 
@@ -526,9 +532,10 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     /* Wi-Fi MAC + PHY emulation: vendored from lcgamboa.  The MAC
      * (esp32_wifi) needs a NIC backend; PHY-A (esp32_phya) and
      * front-end (esp32_fe) are unconditional.  Surrounding regions
-     * (fe2/nrx/bb/chipv7_phy/chipv7_phyb) plus the non-PHY peripheral
-     * stubs (analog/rtcio/sens/iomux/apbctrl/i2s0/i2s1/rmt/pcnt/mcpwm)
-     * keep a plain stateful backing via esp32_wifi_stub. */
+     * (fe2/nrx/bb/chipv7_phy/chipv7_phyb) plus the remaining peripheral
+     * stubs (rtcio/apbctrl/i2s0/i2s1/rmt/pcnt/mcpwm) keep a plain
+     * stateful backing via esp32_wifi_stub.  IO_MUX and SENS are now
+     * modeled as real qdev devices (vendored from lcgamboa). */
     qdev_realize(DEVICE(&s->fe), &s->periph_bus, &error_fatal);
     esp32_soc_add_periph_device(sys_mem, &s->fe, DR_REG_FE_BASE);
 
@@ -537,6 +544,12 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
 
     qdev_realize(DEVICE(&s->ana), &s->periph_bus, &error_fatal);
     esp32_soc_add_periph_device(sys_mem, &s->ana, DR_REG_ANA_BASE);
+
+    qdev_realize(DEVICE(&s->iomux), &s->periph_bus, &error_fatal);
+    esp32_soc_add_periph_device(sys_mem, &s->iomux, DR_REG_IO_MUX_BASE);
+
+    qdev_realize(DEVICE(&s->sens), &s->periph_bus, &error_fatal);
+    esp32_soc_add_periph_device(sys_mem, &s->sens, DR_REG_SENS_BASE);
 
     NICInfo *wifi_nd = qemu_find_nic_info(TYPE_ESP32_WIFI, false, NULL);
     if (wifi_nd != NULL) {
@@ -552,16 +565,28 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                                (base_) - DR_REG_DPORT_APB_BASE + APB_REG_BASE, \
                                (size_), (default_))
     ESP32_WIFI_STUB("esp32.rtcio",       DR_REG_RTCIO_BASE,   0x400,  0xffffffff);
-    ESP32_WIFI_STUB("esp32.sens",        DR_REG_SENS_BASE,    0x400,  0xffffffff);
-    ESP32_WIFI_STUB("esp32.iomux",       DR_REG_IO_MUX_BASE,  0x2000, 0xffffffff);
+    /* esp32.sens and esp32.iomux are now real qdev devices vendored
+     * from lcgamboa (realized above near esp32_phya/ana). */
     /* fe2/nrx/bb/chipv7_phy/chipv7_phyb mirror lcgamboa's
      * create_unimplemented_device_default_value(-1) stubs. */
     ESP32_WIFI_STUB("esp32.fe2",         DR_REG_FE2_BASE,     0x1000, 0xffffffff);
-    ESP32_WIFI_STUB("esp32.nrx",         0x3ff4e000,          0x1000, 0xffffffff);
-    ESP32_WIFI_STUB("esp32.bb",          0x3ff5c000,          0x2000, 0xffffffff);
+    /* Previously a wifi_stub overlay called "esp32.nrx" was mapped
+     * at 0x3ff4e000 — but that is DR_REG_ANA_BASE, not NRX
+     * (DR_REG_NRX_BASE = 0x3ff5cc00, inside the BB region).  The
+     * overlay shadowed esp32_ana, including its offset-0xC4 channel
+     * write handler, which broke libphy's phy_dis_hw_set_freq()
+     * poll.  Real NRX is covered by the BB stub below. */
+    /* BB default 0: libphy's set_channel_rfpll_freq() reads
+     * BB[0x1008] and treats non-zero bits 29-31 as "calibration
+     * needed -> long path"; returning 0 takes the short path. */
+    ESP32_WIFI_STUB("esp32.bb",          0x3ff5c000,          0x2000, 0x00000000);
     ESP32_WIFI_STUB("esp32.chipv7_phy",  0x3ff71000,          0x1000, 0xffffffff);
     ESP32_WIFI_STUB("esp32.chipv7_phyb", DR_REG_WDEV_BASE,    0x1000, 0x00000000);
     ESP32_WIFI_STUB("esp32.apbctrl",     DR_REG_APB_CTRL_BASE, 0x1000, 0x00000000);
+    /* libphy touches the BT controller's MMIO during PHY init
+     * because WiFi/BT share RF infrastructure on the real chip.
+     * Without coverage the access aborts with LoadStorePIFAddrError. */
+    ESP32_WIFI_STUB("esp32.bt",          DR_REG_BT_BASE,      0x1000, 0x00000000);
 #undef ESP32_WIFI_STUB
 
     esp32_soc_add_unimp_device(sys_mem, "esp32.hinf", DR_REG_HINF_BASE, 0x1000);
@@ -580,7 +605,12 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     ESP32_WIFI_STUB("esp32.i2s1",  DR_REG_I2S1_BASE, 0x1000, 0xffffffff);
     ESP32_WIFI_STUB("esp32.rmt",   DR_REG_RMT_BASE,  0x1000, 0xffffffff);
     ESP32_WIFI_STUB("esp32.pcnt",  DR_REG_PCNT_BASE, 0x1000, 0xffffffff);
-    ESP32_WIFI_STUB("esp32.mcpwm", 0x3ff70000,       0x8000, 0xffffffff);
+    /* Keep mcpwm at 0x8000 — chipv7_phy/WIFI/PHYA/WDEV stubs and
+     * device are registered earlier and take precedence at the same
+     * subregion priority, so this catch-all doesn't actually shadow
+     * them.  Shrinking it broke IDF boot (regions in 0x3ff76xxx-
+     * 0x3ff77xxx then went unmapped). */
+    ESP32_WIFI_STUB("esp32.mcpwm", DR_REG_PWM3_BASE, 0x8000, 0xffffffff);
 #undef ESP32_WIFI_STUB
 
     /* Catch-all for remaining peripheral space to avoid panics */
@@ -682,6 +712,8 @@ static void esp32_soc_init(Object *obj)
     object_initialize_child(obj, "fe", &s->fe, TYPE_ESP32_FE);
     object_initialize_child(obj, "phya", &s->phya, TYPE_ESP32_PHYA);
     object_initialize_child(obj, "ana", &s->ana, TYPE_ESP32_ANA);
+    object_initialize_child(obj, "iomux", &s->iomux, TYPE_ESP32_IOMUX);
+    object_initialize_child(obj, "sens", &s->sens, TYPE_ESP32_SENS);
 
     object_initialize_child(obj, "flash_enc", &s->flash_enc, TYPE_ESP32_FLASH_ENCRYPTION);
 

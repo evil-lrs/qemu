@@ -15,16 +15,24 @@ typedef struct WifiStubRegion {
     uint32_t *storage;
     bool *touched;
     uint32_t default_val;
+    uint32_t self_clear_mask;
 } WifiStubRegion;
 
 static uint64_t wifi_stub_read(void *opaque, hwaddr off, unsigned size)
 {
     WifiStubRegion *r = opaque;
     hwaddr idx = off / 4;
+    uint32_t v;
     if (idx >= r->words) {
-        return r->default_val;
+        v = r->default_val;
+    } else {
+        v = r->touched[idx] ? r->storage[idx] : r->default_val;
     }
-    return r->touched[idx] ? r->storage[idx] : r->default_val;
+    /* Bits in self_clear_mask model hardware "busy" / "trigger"
+     * flags that the real silicon auto-clears once a transaction
+     * completes.  Always report them as 0 so polling loops
+     * (e.g. libphy's i2c_master_reset) terminate. */
+    return v & ~r->self_clear_mask;
 }
 
 static void wifi_stub_write(void *opaque, hwaddr off, uint64_t val,
@@ -35,7 +43,7 @@ static void wifi_stub_write(void *opaque, hwaddr off, uint64_t val,
     if (idx >= r->words) {
         return;
     }
-    r->storage[idx] = (uint32_t)val;
+    r->storage[idx] = ((uint32_t)val) & ~r->self_clear_mask;
     r->touched[idx] = true;
 }
 
@@ -49,9 +57,11 @@ static const MemoryRegionOps wifi_stub_ops = {
     .impl.max_access_size = 4,
 };
 
-void esp32_wifi_stub_add_region(const char *name, hwaddr dport_base,
-                                hwaddr apb_base, size_t size,
-                                uint32_t default_val)
+static void esp32_wifi_stub_add_region_internal(const char *name,
+                                                hwaddr dport_base,
+                                                hwaddr apb_base, size_t size,
+                                                uint32_t default_val,
+                                                uint32_t self_clear_mask)
 {
     MemoryRegion *sys_mem = get_system_memory();
     WifiStubRegion *r = g_new0(WifiStubRegion, 1);
@@ -60,6 +70,7 @@ void esp32_wifi_stub_add_region(const char *name, hwaddr dport_base,
     r->storage = g_new0(uint32_t, r->words);
     r->touched = g_new0(bool, r->words);
     r->default_val = default_val;
+    r->self_clear_mask = self_clear_mask;
 
     MemoryRegion *mr_dport = g_new0(MemoryRegion, 1);
     memory_region_init_io(mr_dport, NULL, &wifi_stub_ops, r, r->name, size);
@@ -70,4 +81,22 @@ void esp32_wifi_stub_add_region(const char *name, hwaddr dport_base,
     memory_region_init_io(mr_apb, NULL, &wifi_stub_ops, r, apb_name, size);
     memory_region_add_subregion_overlap(sys_mem, apb_base, mr_apb, 0);
     g_free(apb_name);
+}
+
+void esp32_wifi_stub_add_region(const char *name, hwaddr dport_base,
+                                hwaddr apb_base, size_t size,
+                                uint32_t default_val)
+{
+    esp32_wifi_stub_add_region_internal(name, dport_base, apb_base, size,
+                                        default_val, 0);
+}
+
+void esp32_wifi_stub_add_region_self_clear(const char *name,
+                                           hwaddr dport_base,
+                                           hwaddr apb_base, size_t size,
+                                           uint32_t default_val,
+                                           uint32_t self_clear_mask)
+{
+    esp32_wifi_stub_add_region_internal(name, dport_base, apb_base, size,
+                                        default_val, self_clear_mask);
 }

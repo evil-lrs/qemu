@@ -17,7 +17,7 @@
 
 static uint64_t esp32_wifi_read(void *opaque, hwaddr addr, unsigned int size)
 {
-    
+
     Esp32WifiState *s = ESP32_WIFI(opaque);
     uint32_t r = s->mem[addr/4];
     
@@ -32,7 +32,15 @@ static uint64_t esp32_wifi_read(void *opaque, hwaddr addr, unsigned int size)
         case A_WIFI_STATUS:
         case A_WIFI_DMA_OUT_STATUS:
             r=1;
-            break;           
+            break;
+        case 0xcb8:
+            /* libphy's chip_sleep_prot_en() polls bits 13-14 of this
+             * register waiting for the MAC sleep-protect FSM to
+             * settle.  Clear those bits unconditionally on read so
+             * the poll terminates; storage of other bits (0x07ff8000
+             * set by the same function) is preserved. */
+            r &= ~0x00006000u;
+            break;
     }
 
     if(DEBUG) printf("esp32_wifi_read  0x%04lx= 0x%08x\n",(unsigned long) addr,r);
