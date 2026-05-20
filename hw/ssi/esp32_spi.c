@@ -390,6 +390,33 @@ static inline int bitlen_to_bytes(uint32_t val)
     return (val + 1 + 7) / 8; /* bitlen registers hold number of bits, minus one */
 }
 
+/* Real ESP32 SPI hardware sends addresses MSB-first on the wire, regardless
+ * of which command path (READ, USR, PP, SE, BE) is used. Software writes the
+ * address into addr_reg in "natural" form (high byte = first byte on wire).
+ * Our txrx buffer just memcpys the uint32_t LSB-first, so we have to swap the
+ * bytes to put them in wire order. Only applies to SPI1 (flash); SPI2/SPI3
+ * carry their own framing via attached qdev devices like sx127x. */
+static uint32_t esp32_spi_flash_addr_to_wire(Esp32SpiState *s,
+                                             uint32_t addr_reg,
+                                             int addr_bytes)
+{
+    if (s->id != 1) {
+        return addr_reg;
+    }
+    if (addr_bytes == 3) {
+        return ((addr_reg & 0x0000ff) << 16) |
+               (addr_reg & 0x00ff00) |
+               ((addr_reg & 0xff0000) >> 16);
+    }
+    if (addr_bytes == 4) {
+        return ((addr_reg & 0x000000ff) << 24) |
+               ((addr_reg & 0x0000ff00) << 8) |
+               ((addr_reg & 0x00ff0000) >> 8) |
+               ((addr_reg & 0xff000000) >> 24);
+    }
+    return addr_reg;
+}
+
 static void maybe_encrypt_data(Esp32SpiState *s)
 {
     Esp32FlashEncryptionState* flash_enc = esp32_flash_encryption_find();
@@ -412,21 +439,7 @@ static void esp32_spi_do_command(Esp32SpiState* s, uint32_t cmd_reg)
         t.cmd = CMD_READ;
         t.cmd_bytes = 1;
         t.addr_bytes = bitlen_to_bytes(FIELD_EX32(s->user1_reg, SPI_USER1, ADDR_BITLEN));
-        t.addr = s->addr_reg;
-        /* SPI Flash (SPI1) expects addresses MSB-first.
-         * Reverse only when the driver is reading. */
-        if (s->id == 1) {
-            if (t.addr_bytes == 3) {
-                t.addr = ((s->addr_reg & 0x0000ff) << 16) |
-                         (s->addr_reg & 0x00ff00) |
-                         ((s->addr_reg & 0xff0000) >> 16);
-            } else if (t.addr_bytes == 4) {
-                t.addr = ((s->addr_reg & 0x000000ff) << 24) |
-                         ((s->addr_reg & 0x0000ff00) << 8) |
-                         ((s->addr_reg & 0x00ff0000) >> 8) |
-                         ((s->addr_reg & 0xff000000) >> 24);
-            }
-        }
+        t.addr = esp32_spi_flash_addr_to_wire(s, s->addr_reg, t.addr_bytes);
         t.data = &s->data_reg[0];
         t.data_rx_bytes = bitlen_to_bytes(s->miso_dlen_reg);
         break;
@@ -514,7 +527,7 @@ static void esp32_spi_do_command(Esp32SpiState* s, uint32_t cmd_reg)
         }
         if (FIELD_EX32(s->user_reg, SPI_USER, ADDR)) {
             t.addr_bytes = bitlen_to_bytes(FIELD_EX32(s->user1_reg, SPI_USER1, ADDR_BITLEN));
-            t.addr = s->addr_reg;
+            t.addr = esp32_spi_flash_addr_to_wire(s, s->addr_reg, t.addr_bytes);
         } else {
             t.addr_bytes = 0;
         }
