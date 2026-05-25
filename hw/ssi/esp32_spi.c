@@ -390,15 +390,27 @@ static inline int bitlen_to_bytes(uint32_t val)
     return (val + 1 + 7) / 8; /* bitlen registers hold number of bits, minus one */
 }
 
-/* Real ESP32 SPI hardware sends addresses MSB-first on the wire, regardless
- * of which command path (READ, USR, PP, SE, BE) is used. Software writes the
- * address into addr_reg in "natural" form (high byte = first byte on wire).
- * Our txrx buffer just memcpys the uint32_t LSB-first, so we have to swap the
- * bytes to put them in wire order. Only applies to SPI1 (flash); SPI2/SPI3
- * carry their own framing via attached qdev devices like sx127x. */
-static uint32_t esp32_spi_flash_addr_to_wire(Esp32SpiState *s,
-                                             uint32_t addr_reg,
-                                             int addr_bytes)
+/* Real ESP32 SPI hardware sends addresses MSB-first on the wire. Our
+ * txrx buffer memcpys uint32_t LSB-first, so we need to byte-swap.
+ *
+ * Two address-register encodings coexist in real firmware:
+ *
+ *   "raw" (used by ROM SPIRead and the legacy R_SPI_CMD_READ_MASK path):
+ *       addr_reg = address.  Address lives in the low N bits.
+ *       For addr_bytes=3 the wire bytes are byteswap of the low 24 bits.
+ *
+ *   "shifted" (used by ESP-IDF's esp_flash subsystem on the USR command
+ *       path, e.g. SE/BE/PP/0xBB Dual-I/O Fast Read):
+ *       addr_reg = (address << 8) | mode_byte.  Address lives in
+ *       bits[31:8]; bits[7:0] hold a mode/dummy byte.
+ *       For addr_bytes=3 the wire bytes are bits[31:8] MSB-first.
+ *       For addr_bytes=4 the wire bytes are all 32 bits MSB-first.
+ *
+ * Only applies to SPI1 (flash); SPI2/SPI3 carry their own framing via
+ * attached qdev devices like sx127x. */
+static uint32_t esp32_spi_flash_addr_raw_to_wire(Esp32SpiState *s,
+                                                 uint32_t addr_reg,
+                                                 int addr_bytes)
 {
     if (s->id != 1) {
         return addr_reg;
@@ -409,6 +421,30 @@ static uint32_t esp32_spi_flash_addr_to_wire(Esp32SpiState *s,
                ((addr_reg & 0xff0000) >> 16);
     }
     if (addr_bytes == 4) {
+        return ((addr_reg & 0x000000ff) << 24) |
+               ((addr_reg & 0x0000ff00) << 8) |
+               ((addr_reg & 0x00ff0000) >> 8) |
+               ((addr_reg & 0xff000000) >> 24);
+    }
+    return addr_reg;
+}
+
+static uint32_t esp32_spi_flash_addr_shifted_to_wire(Esp32SpiState *s,
+                                                     uint32_t addr_reg,
+                                                     int addr_bytes)
+{
+    if (s->id != 1) {
+        return addr_reg;
+    }
+    if (addr_bytes == 3) {
+        /* bits[31:8] MSB-first → buf[0]=bits[31:24], buf[1]=bits[23:16],
+         * buf[2]=bits[15:8].  buf[3] is not sent. */
+        return ((addr_reg >> 24) & 0xff) |
+               ((addr_reg >> 8)  & 0xff00) |
+               ((addr_reg << 8)  & 0xff0000);
+    }
+    if (addr_bytes == 4) {
+        /* Full bswap32: bits[31:0] MSB-first as 4 wire bytes. */
         return ((addr_reg & 0x000000ff) << 24) |
                ((addr_reg & 0x0000ff00) << 8) |
                ((addr_reg & 0x00ff0000) >> 8) |
@@ -439,7 +475,7 @@ static void esp32_spi_do_command(Esp32SpiState* s, uint32_t cmd_reg)
         t.cmd = CMD_READ;
         t.cmd_bytes = 1;
         t.addr_bytes = bitlen_to_bytes(FIELD_EX32(s->user1_reg, SPI_USER1, ADDR_BITLEN));
-        t.addr = esp32_spi_flash_addr_to_wire(s, s->addr_reg, t.addr_bytes);
+        t.addr = esp32_spi_flash_addr_raw_to_wire(s, s->addr_reg, t.addr_bytes);
         t.data = &s->data_reg[0];
         t.data_rx_bytes = bitlen_to_bytes(s->miso_dlen_reg);
         break;
@@ -527,7 +563,7 @@ static void esp32_spi_do_command(Esp32SpiState* s, uint32_t cmd_reg)
         }
         if (FIELD_EX32(s->user_reg, SPI_USER, ADDR)) {
             t.addr_bytes = bitlen_to_bytes(FIELD_EX32(s->user1_reg, SPI_USER1, ADDR_BITLEN));
-            t.addr = esp32_spi_flash_addr_to_wire(s, s->addr_reg, t.addr_bytes);
+            t.addr = esp32_spi_flash_addr_shifted_to_wire(s, s->addr_reg, t.addr_bytes);
         } else {
             t.addr_bytes = 0;
         }
