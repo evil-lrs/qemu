@@ -3,10 +3,7 @@
 
 #include "hw/sysbus.h"
 #include "hw/xtensa/xtensa_memory.h"
-#include "hw/char/serial.h"
-#include "hw/timer/esp32_frc_timer.h"
-#include "hw/ssi/esp32_spi.h"
-#include "hw/gpio/esp32_gpio.h"
+#include "chardev/char-fe.h"
 
 #define ESP8266_CPU_COUNT 1
 
@@ -17,11 +14,24 @@ typedef struct Esp8266SocState {
     MemoryRegion iram;
     MemoryRegion irom;
     MemoryRegion drom;
+    MemoryRegion uart0;
 
+    CharBackend uart0_chr;
     XtensaCPU cpu[ESP8266_CPU_COUNT];
 } Esp8266SocState;
 
+typedef struct Esp8266MachineState {
+    MachineState parent;
+
+    char *radio_config;
+    char *radio_air_chardev;
+} Esp8266MachineState;
+
 #define TYPE_ESP8266_SOC "xtensa.esp8266"
 #define ESP8266_SOC(obj) OBJECT_CHECK(Esp8266SocState, (obj), TYPE_ESP8266_SOC)
+
+#define TYPE_ESP8266_MACHINE MACHINE_TYPE_NAME("esp8266")
+#define ESP8266_MACHINE(obj) \
+    OBJECT_CHECK(Esp8266MachineState, (obj), TYPE_ESP8266_MACHINE)
 
 #endif
