@@ -15,6 +15,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(LR1121State, LR1121)
 #define LR1121_REG_BYTES 0x10000
 #define LR1121_BUF_BYTES 256
 
+void lr1121_linker_anchor(void);
+
 typedef enum LR1121Phase {
     LR1121_STATE_IDLE = 0,
     LR1121_STATE_OPCODE_LSB,

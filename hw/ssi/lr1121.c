@@ -518,6 +518,113 @@ static void lr1121_log_tx_payload(LR1121State *s)
     g_string_free(js, true);
 }
 
+static const char *lr1121_packet_type_name(uint8_t type)
+{
+    switch (type) {
+    case 0x01: return "GFSK";
+    case 0x02: return "LoRa";
+    case 0x03: return "Sigfox";
+    case 0x04: return "LR-FHSS";
+    default: return "unknown";
+    }
+}
+
+static const char *lr1121_lora_bw_name(uint8_t bw)
+{
+    switch (bw) {
+    case 0x03: return "62.5kHz";
+    case 0x04: return "125kHz";
+    case 0x05: return "250kHz";
+    case 0x06: return "500kHz";
+    case 0x0d: return "203kHz";
+    case 0x0e: return "406kHz";
+    case 0x0f: return "812.5kHz";
+    default: return "?";
+    }
+}
+
+static const char *lr1121_lora_cr_name(uint8_t cr)
+{
+    switch (cr) {
+    case 0x01: return "4/5";
+    case 0x02: return "4/6";
+    case 0x03: return "4/7";
+    case 0x04: return "4/8";
+    case 0x05: return "4/5LI";
+    case 0x06: return "4/6LI";
+    case 0x07: return "4/8LI";
+    default: return "?";
+    }
+}
+
+static void lr1121_format_bytes(char *out, size_t out_len,
+                                const uint8_t *bytes, size_t len)
+{
+    size_t pos = 0;
+
+    if (out_len == 0) {
+        return;
+    }
+    out[0] = '\0';
+
+    for (size_t i = 0; i < len && pos + 4 < out_len; i++) {
+        pos += snprintf(out + pos, out_len - pos, "%s%02x",
+                        i == 0 ? "" : " ", bytes[i]);
+    }
+}
+
+static void lr1121_log_config_event(LR1121State *s, const char *event)
+{
+    char raw[128];
+    lr1121_format_bytes(raw, sizeof(raw), s->param_buf, s->param_pos);
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "LR1121_EVENT spi=%u cs=%u event=%s opcode=0x%04x "
+                  "freq_hz=%u packet_type=0x%02x(%s) raw=[%s]\n",
+                  s->spi_id, s->parent_obj.cs_index, event, s->opcode,
+                  s->rf_freq_hz, s->packet_type,
+                  lr1121_packet_type_name(s->packet_type), raw);
+}
+
+static void lr1121_log_lora_mod_params(LR1121State *s)
+{
+    char raw[128];
+    lr1121_format_bytes(raw, sizeof(raw), s->param_buf, s->param_pos);
+
+    if (s->param_pos >= 4) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "LR1121_EVENT spi=%u cs=%u event=SetModulationParams "
+                      "packet=LoRa sf=SF%u bw=0x%02x(%s) cr=0x%02x(%s) "
+                      "ldro=0x%02x raw=[%s]\n",
+                      s->spi_id, s->parent_obj.cs_index,
+                      s->param_buf[0],
+                      s->param_buf[1], lr1121_lora_bw_name(s->param_buf[1]),
+                      s->param_buf[2], lr1121_lora_cr_name(s->param_buf[2]),
+                      s->param_buf[3], raw);
+    } else {
+        lr1121_log_config_event(s, "SetModulationParams");
+    }
+}
+
+static void lr1121_log_lora_packet_params(LR1121State *s)
+{
+    char raw[128];
+    lr1121_format_bytes(raw, sizeof(raw), s->param_buf, s->param_pos);
+
+    if (s->param_pos >= 6) {
+        uint16_t preamble = ((uint16_t)s->param_buf[0] << 8) | s->param_buf[1];
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "LR1121_EVENT spi=%u cs=%u event=SetPacketParams "
+                      "packet=LoRa preamble=%u header=0x%02x payload_len=%u "
+                      "crc=0x%02x invert_iq=0x%02x raw=[%s]\n",
+                      s->spi_id, s->parent_obj.cs_index, preamble,
+                      s->param_buf[2], s->param_buf[3],
+                      s->param_buf[4], s->param_buf[5], raw);
+    } else {
+        lr1121_log_config_event(s, "SetPacketParams");
+    }
+}
+
 static void lr1121_complete_opcode(LR1121State *s)
 {
     const char *name = lr1121_opcode_name(s->opcode);
@@ -542,17 +649,24 @@ static void lr1121_complete_opcode(LR1121State *s)
             ((uint32_t)s->param_buf[2] << 8)  |
             ((uint32_t)s->param_buf[3]);
         lr1121_send_state(s);
+        lr1121_log_config_event(s, "SetRfFrequency");
         break;
 
     case LR1121_OP_SET_PACKET_TYPE:
         s->packet_type = s->param_buf[0];
         lr1121_send_state(s);
+        lr1121_log_config_event(s, "SetPacketType");
         break;
 
     case LR1121_OP_SET_MODULATION_PARAMS:
         s->modulation_params_len = MIN((size_t)s->param_pos,
                                        sizeof(s->modulation_params));
         memcpy(s->modulation_params, s->param_buf, s->modulation_params_len);
+        if (s->packet_type == 0x02) {
+            lr1121_log_lora_mod_params(s);
+        } else {
+            lr1121_log_config_event(s, "SetModulationParams");
+        }
         break;
 
     case LR1121_OP_SET_PACKET_PARAMS:
@@ -561,7 +675,13 @@ static void lr1121_complete_opcode(LR1121State *s)
         memcpy(s->packet_params, s->param_buf, s->packet_params_len);
 
         if (s->param_pos >= 6) {
-            s->tx_payload_len = s->param_buf[5];
+            s->tx_payload_len = s->packet_type == 0x02 ?
+                s->param_buf[3] : s->param_buf[5];
+        }
+        if (s->packet_type == 0x02) {
+            lr1121_log_lora_packet_params(s);
+        } else {
+            lr1121_log_config_event(s, "SetPacketParams");
         }
         break;
 
@@ -584,6 +704,7 @@ static void lr1121_complete_opcode(LR1121State *s)
         s->irq_dio3 = 0;
         qemu_log_mask(LOG_GUEST_ERROR, "LR1121[SPI%d:CS%d]: SetDioIrqParams irq1=0x%08x irq2=0x%08x\n",
                       s->spi_id, s->parent_obj.cs_index, s->irq_dio1, s->irq_dio2);
+        lr1121_log_config_event(s, "SetDioIrqParams");
         break;
 
     case LR1121_OP_CLEAR_IRQ: {
@@ -604,16 +725,20 @@ static void lr1121_complete_opcode(LR1121State *s)
 
     case LR1121_OP_SET_PA_CONFIG:
         /* Stub: PA config not modeled, just store if needed */
+        lr1121_log_config_event(s, "SetPaConfig");
         break;
 
     case LR1121_OP_SET_TCXO_MODE:
         /* Stub: TCXO not modeled */
+        lr1121_log_config_event(s, "SetTcxoMode");
         break;
 
     case LR1121_OP_CALIBRATE:
     case LR1121_OP_CALIB_IMAGE:
         /* Stub: Calibration returns to Standby RC */
         s->status2 = (s->status2 & 0xF1) | (LR1121_STAT2_MODE_STDBY_RC << 1);
+        lr1121_log_config_event(s, s->opcode == LR1121_OP_CALIBRATE ?
+                                "Calibrate" : "CalibImage");
         break;
 
     case LR1121_OP_READ_REG_MEM32:
@@ -685,11 +810,13 @@ static void lr1121_complete_opcode(LR1121State *s)
         s->irq_status |= LR1121_IRQ_TX_DONE;
         s->status2 = (s->status2 & 0xF1) | (LR1121_STAT2_MODE_TX << 1);
         lr1121_send_state(s);
+        lr1121_log_config_event(s, "SetTx");
         break;
 
     case LR1121_OP_SET_RX:
         s->status2 = (s->status2 & 0xF1) | (LR1121_STAT2_MODE_RX << 1);
         lr1121_send_state(s);
+        lr1121_log_config_event(s, "SetRx");
         break;
 
     case LR1121_OP_SET_LORA_PUBLIC_NET:
@@ -717,15 +844,25 @@ static void lr1121_complete_opcode(LR1121State *s)
 
     case LR1121_OP_SET_RX_TX_FALLBACK_MODE:
         s->fallback_mode = s->param_buf[0];
+        lr1121_log_config_event(s, "SetRxTxFallbackMode");
         break;
 
     case LR1121_OP_RESET_STATS:
         /* Stub: stats not modeled */
         break;
 
+    case LR1121_OP_SET_CAD_PARAMS:
+        lr1121_log_config_event(s, "SetCadParams");
+        break;
+
+    case LR1121_OP_SET_DIO_AS_RF_SWITCH:
+        lr1121_log_config_event(s, "SetDioAsRfSwitch");
+        break;
+
     case LR1121_OP_SET_CAD:
         s->irq_status |= 0x00000100u; /* CAD_DONE */
         s->status2 = (s->status2 & 0xF1) | (LR1121_STAT2_MODE_STDBY_RC << 1);
+        lr1121_log_config_event(s, "SetCad");
         break;
 
     case LR1121_OP_REBOOT:
@@ -1067,3 +1204,7 @@ static void lr1121_register_types(void)
 }
 
 type_init(lr1121_register_types)
+
+void lr1121_linker_anchor(void)
+{
+}

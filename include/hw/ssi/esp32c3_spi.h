@@ -7,6 +7,7 @@
 
 #define TYPE_ESP32C3_SPI "ssi.esp32c3.spi"
 #define ESP32C3_SPI(obj) OBJECT_CHECK(ESP32C3SpiState, (obj), TYPE_ESP32C3_SPI)
+#define ESP32C3_SPI_EXTERNAL_CS_GPIO "external-cs"
 
 /**
  * Size of the SPI I/O registers area
@@ -24,6 +25,9 @@ typedef struct ESP32C3SpiState {
     MemoryRegion iomem;
     SSIBus *spi;
     qemu_irq cs_gpio[ESP32C3_SPI_CS_COUNT];
+    bool external_cs_valid[ESP32C3_SPI_CS_COUNT];
+    int external_cs_level[ESP32C3_SPI_CS_COUNT];
+    uint8_t id;
 
     uint32_t mem_cmd;
     /**
@@ -41,6 +45,8 @@ typedef struct ESP32C3SpiState {
     uint32_t mem_user2;
     uint32_t mem_miso_len;
     uint32_t mem_mosi_len;
+    uint32_t mem_ms_dlen;
+    uint32_t mem_misc;
     uint32_t mem_rd_st;
     uint32_t data_reg[ESP32C3_SPI_BUF_WORDS];
     uint32_t mem_sus_st;

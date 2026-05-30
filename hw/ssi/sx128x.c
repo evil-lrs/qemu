@@ -516,3 +516,7 @@ static void sx128x_register_types(void)
 }
 
 type_init(sx128x_register_types)
+
+void sx128x_linker_anchor(void)
+{
+}

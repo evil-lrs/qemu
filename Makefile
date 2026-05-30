@@ -86,7 +86,7 @@ esp32-clean:
 esp32c3-configure:
 	mkdir -p "$(ESP32C3_BUILD_DIR)"
 	cd "$(ESP32C3_BUILD_DIR)" && PKG_CONFIG_PATH="$(ESP32_PKG_CONFIG_PATH)" \
-	"$(SRC_PATH)/configure" \
+	../configure \
 	  --target-list=riscv32-softmmu \
 	  --disable-gnutls --enable-gcrypt \
 	  --disable-gtk \
@@ -95,8 +95,13 @@ esp32c3-configure:
 	  --disable-vnc \
 	  --disable-opengl \
 	  --disable-virglrenderer \
+	  --disable-guest-agent \
+	  --disable-plugins \
+	  --disable-slirp \
+	  --disable-gio \
 	  --enable-debug \
 	  --disable-strip \
+	  --without-default-features \
 	  --disable-werror
 
 esp32c3-build:

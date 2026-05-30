@@ -40,6 +40,9 @@
 #include "hw/timer/esp32c3_timg.h"
 #include "hw/timer/esp32c3_systimer.h"
 #include "hw/ssi/esp32c3_spi.h"
+#include "hw/ssi/sx127x.h"
+#include "hw/ssi/sx128x.h"
+#include "hw/ssi/lr1121.h"
 #include "hw/misc/esp32c3_rtc_cntl.h"
 #include "hw/misc/esp32c3_aes.h"
 #include "hw/misc/esp32c3_rsa.h"
@@ -88,6 +91,7 @@ struct Esp32C3MachineState {
     ESP32C3TimgState timg[2];
     ESP32C3SysTimerState systimer;
     ESP32C3SpiState spi1;
+    ESP32C3SpiState spi2;
     ESP32C3RtcCntlState rtccntl;
     ESP32C3UsbJtagState jtag;
     ESPRgbState rgb;
@@ -234,6 +238,160 @@ static void esp32c3_init_spi_flash(Esp32C3MachineState *ms, BlockBackend* blk)
     qdev_realize(flash_dev, spi_bus, &error_fatal);
     qdev_connect_gpio_out_named(spi_master, SSI_GPIO_CS, 0,
                                 qdev_get_gpio_in_named(flash_dev, SSI_GPIO_CS, 0));
+}
+
+static bool esp32c3_gpio_pin_valid(int pin)
+{
+    return pin >= 0 && pin < ESP32_GPIO_PIN_COUNT;
+}
+
+static void esp32c3_machine_connect_radio_dio(Esp32C3MachineState *ms,
+                                              DeviceState *radio,
+                                              const char *gpio_name,
+                                              int dio_index,
+                                              int gpio_pin,
+                                              int chip_index,
+                                              const char *label)
+{
+    if (!esp32c3_gpio_pin_valid(gpio_pin)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32-C3 radio DIO: chip[%d].%s invalid gpio=%d; skipping\n",
+                      chip_index, label, gpio_pin);
+        return;
+    }
+
+    qdev_connect_gpio_out_named(radio, gpio_name, dio_index,
+                                qdev_get_gpio_in_named(DEVICE(&ms->gpio),
+                                                       ESP32_GPIO_IN_GPIO,
+                                                       gpio_pin));
+    qemu_log("ESP32-C3 radio DIO: chip[%d].%s -> gpio=%d\n",
+             chip_index, label, gpio_pin);
+}
+
+static void esp32c3_machine_connect_radio_busy(Esp32C3MachineState *ms,
+                                               DeviceState *radio,
+                                               const char *gpio_name,
+                                               int gpio_pin,
+                                               int chip_index)
+{
+    if (!esp32c3_gpio_pin_valid(gpio_pin)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32-C3 radio BUSY: chip[%d].busy invalid gpio=%d; skipping\n",
+                      chip_index, gpio_pin);
+        return;
+    }
+
+    qdev_connect_gpio_out_named(radio, gpio_name, 0,
+                                qdev_get_gpio_in_named(DEVICE(&ms->gpio),
+                                                       ESP32_GPIO_IN_GPIO,
+                                                       gpio_pin));
+    qemu_log("ESP32-C3 radio BUSY: chip[%d].busy -> gpio=%d\n",
+             chip_index, gpio_pin);
+}
+
+static void esp32c3_machine_connect_radio_signals(Esp32C3MachineState *ms,
+                                                  DeviceState *radio,
+                                                  EspRadioType type,
+                                                  const EspRadioChipConfig *chip,
+                                                  int chip_index)
+{
+    switch (type) {
+    case ESP_RADIO_SX127X:
+        esp32c3_machine_connect_radio_dio(ms, radio, SX127X_DIO_GPIO, 0,
+                                          chip->dio0, chip_index, "dio0");
+        esp32c3_machine_connect_radio_dio(ms, radio, SX127X_DIO_GPIO, 1,
+                                          chip->dio1, chip_index, "dio1");
+        break;
+    case ESP_RADIO_SX128X:
+        esp32c3_machine_connect_radio_dio(ms, radio, SX128X_DIO_GPIO, 0,
+                                          chip->dio1, chip_index, "dio1");
+        esp32c3_machine_connect_radio_busy(ms, radio, SX128X_BUSY_GPIO,
+                                           chip->busy, chip_index);
+        break;
+    case ESP_RADIO_LR1121:
+        esp32c3_machine_connect_radio_dio(ms, radio, LR1121_DIO_GPIO, 0,
+                                          chip->dio1, chip_index, "dio1");
+        esp32c3_machine_connect_radio_busy(ms, radio, LR1121_BUSY_GPIO,
+                                           chip->busy, chip_index);
+        break;
+    case ESP_RADIO_NONE:
+        break;
+    }
+}
+
+static void esp32c3_machine_init_radios(Esp32C3MachineState *ms,
+                                        const EspRadioBoardConfig *cfg,
+                                        const char *air_chardev_name)
+{
+    sx127x_linker_anchor();
+    sx128x_linker_anchor();
+    lr1121_linker_anchor();
+
+    if (!cfg || cfg->type == ESP_RADIO_NONE) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32-C3: no radio attached; pass radio-config=<path.json>\n");
+        return;
+    }
+
+    const char *type_name = esp_radio_qdev_type(cfg->type);
+    if (!type_name) {
+        return;
+    }
+
+    Chardev *air_chr = NULL;
+    if (air_chardev_name) {
+        air_chr = qemu_chr_find(air_chardev_name);
+        if (!air_chr) {
+            error_report("Error: chardev '%s' not found for radio-air-chardev",
+                         air_chardev_name);
+        }
+    }
+
+    DeviceState *spi_master = DEVICE(&ms->spi2);
+    BusState *spi_bus = qdev_get_child_bus(spi_master, "spi");
+    const int chip_count = cfg->chip_count > 0 ? cfg->chip_count : 1;
+
+    qemu_log("ESP32-C3 radio board: type=%s chips=%d config_spi=%d attached_spi=2\n",
+             esp_radio_type_str(cfg->type), chip_count, cfg->spi_bus);
+
+    for (int i = 0; i < chip_count && i < ESP32C3_SPI_CS_COUNT; i++) {
+        DeviceState *radio = qdev_new(type_name);
+        char *id = g_strdup_printf("radio-c3-spi2-cs%d", i);
+        object_property_add_child(OBJECT(ms), id, OBJECT(radio));
+        g_free(id);
+
+        qdev_prop_set_uint8(radio, "spi_id", 2);
+        qdev_prop_set_uint8(radio, "cs", i);
+        if (air_chr && i == 0) {
+            qdev_prop_set_chr(radio, "air-chardev", air_chr);
+        }
+
+        qdev_realize_and_unref(radio, spi_bus, &error_fatal);
+        qdev_connect_gpio_out_named(spi_master, SSI_GPIO_CS, i,
+                                    qdev_get_gpio_in_named(radio,
+                                                           SSI_GPIO_CS, 0));
+        esp32c3_machine_connect_radio_signals(ms, radio, cfg->type,
+                                              &cfg->chips[i], i);
+
+        int nss = cfg->chips[i].nss;
+        if (esp32c3_gpio_pin_valid(nss)) {
+            qdev_connect_gpio_out_named(DEVICE(&ms->gpio),
+                                        ESP32_GPIO_OUT_GPIO, nss,
+                                        qdev_get_gpio_in_named(
+                                            DEVICE(&ms->spi2),
+                                            ESP32C3_SPI_EXTERNAL_CS_GPIO, i));
+            qemu_log("ESP32-C3 radio NSS: gpio=%d -> SPI2 external-cs[%d]\n",
+                     nss, i);
+        } else {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP32-C3 radio NSS: chip[%d] invalid gpio=%d; "
+                          "using hardware CS only\n", i, nss);
+        }
+    }
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "ESP32-C3: fake %s attached to SPI2; NSS/DIO from radio-config\n",
+                  esp_radio_type_str(cfg->type));
 }
 
 
@@ -443,6 +601,7 @@ static void esp32c3_machine_init(MachineState *machine)
     object_initialize_child(OBJECT(machine), "timg1", &ms->timg[1], TYPE_ESP32C3_TIMG);
     object_initialize_child(OBJECT(machine), "systimer", &ms->systimer, TYPE_ESP32C3_SYSTIMER);
     object_initialize_child(OBJECT(machine), "spi1", &ms->spi1, TYPE_ESP32C3_SPI);
+    object_initialize_child(OBJECT(machine), "spi2", &ms->spi2, TYPE_ESP32C3_SPI);
     object_initialize_child(OBJECT(machine), "rtccntl", &ms->rtccntl, TYPE_ESP32C3_RTC_CNTL);
     object_initialize_child(OBJECT(machine), "jtag", &ms->jtag, TYPE_ESP32C3_JTAG);
     object_initialize_child(OBJECT(machine), "rgb", &ms->rgb, TYPE_ESP_RGB);
@@ -490,6 +649,7 @@ static void esp32c3_machine_init(MachineState *machine)
 
     /* SPI1 controller (SPI Flash) */
     {
+        qdev_prop_set_uint8(DEVICE(&ms->spi1), "id", 1);
         ms->spi1.xts_aes = &ms->xts_aes;
         sysbus_realize(SYS_BUS_DEVICE(&ms->spi1), &error_fatal);
         MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ms->spi1), 0);
@@ -497,6 +657,15 @@ static void esp32c3_machine_init(MachineState *machine)
         if (blk) {
             esp32c3_init_spi_flash(ms, blk);
         }
+    }
+
+    /* SPI2 controller (general-purpose radio SPI on ESP32-C3) */
+    {
+        qdev_prop_set_uint8(DEVICE(&ms->spi2), "id", 2);
+        sysbus_realize(SYS_BUS_DEVICE(&ms->spi2), &error_fatal);
+        MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ms->spi2), 0);
+        memory_region_add_subregion_overlap(sys_mem, DR_REG_SPI2_BASE, mr, 0);
+        esp32c3_machine_init_radios(ms, &radio_cfg, ms->radio_air_chardev);
     }
 
     for (int i = 0; i < ESP32C3_UART_COUNT; ++i) {

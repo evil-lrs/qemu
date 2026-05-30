@@ -29,6 +29,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(SX128xState, SX128X)
 #define SX128X_REG_BYTES  0x1000  /* sparse-ish, enough for status + version */
 #define SX128X_DIO_COUNT  3       /* DIO1, DIO2, DIO3 (DIO0 unused on SX128x) */
 
+void sx128x_linker_anchor(void);
+
 typedef enum {
     SX128X_STATE_IDLE,
     SX128X_STATE_PARAMS,    /* clocking opcode parameters in */
