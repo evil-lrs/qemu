@@ -22,6 +22,7 @@ typedef struct Esp8266SocState {
     SysBusDevice parent_obj;
 
     MemoryRegion dram;
+    MemoryRegion low_scratch;
     MemoryRegion sram;
     MemoryRegion dport;
     MemoryRegion iram;
@@ -32,6 +33,8 @@ typedef struct Esp8266SocState {
     MemoryRegion hspi;
     MemoryRegion gpio;
     MemoryRegion spi;
+    MemoryRegion flash_helper;
+    MemoryRegion wdt;
     MemoryRegion i2c;
     MemoryRegion timer0;
     MemoryRegion timer;
@@ -44,6 +47,10 @@ typedef struct Esp8266SocState {
     XtensaCPU cpu[ESP8266_CPU_COUNT];
     SSIBus *hspi_bus;
     qemu_irq hspi_cs;
+    uint8_t spi_flash_status1;
+    uint8_t spi_flash_status2;
+    uint32_t flash_helper_addr;
+    uint32_t flash_helper_src;
     uint32_t gpio_regs[ESP8266_GPIO_MMIO_WORDS];
     uint32_t spi_regs[ESP8266_SPI_MMIO_WORDS];
     uint32_t i2c_regs[ESP8266_I2C_MMIO_WORDS];
