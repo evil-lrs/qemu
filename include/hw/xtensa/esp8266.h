@@ -4,6 +4,7 @@
 #include "hw/sysbus.h"
 #include "hw/xtensa/xtensa_memory.h"
 #include "chardev/char-fe.h"
+#include "target/xtensa/cpu.h"
 
 #define ESP8266_CPU_COUNT 1
 
@@ -12,12 +13,15 @@ typedef struct Esp8266SocState {
 
     MemoryRegion dram;
     MemoryRegion iram;
+    MemoryRegion rom;
     MemoryRegion irom;
     MemoryRegion drom;
     MemoryRegion uart0;
 
     CharBackend uart0_chr;
     XtensaCPU cpu[ESP8266_CPU_COUNT];
+    uint32_t boot_entry;
+    bool boot_loaded;
 } Esp8266SocState;
 
 typedef struct Esp8266MachineState {

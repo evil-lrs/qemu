@@ -33,6 +33,10 @@
 #define TYPE_ESP8266_CPU XTENSA_CPU_TYPE_NAME("lx106")
 #define ESP8266_FLASH_BASE 0x40200000
 #define ESP8266_FLASH_SIZE (1 * MiB)
+#define ESP8266_DRAM_BASE 0x3ffe8000
+#define ESP8266_DRAM_SIZE (80 * KiB)
+#define ESP8266_ROM_BASE 0x40000000
+#define ESP8266_ROM_SIZE (64 * KiB)
 #define ESP8266_IMAGE_MAGIC 0xe9
 #define ESP8266_UART_FIFO 0x00
 #define ESP8266_UART_STATUS 0x1c
@@ -82,6 +86,41 @@ static void esp8266_uart_puts(Esp8266SocState *s, const char *str)
     }
 }
 
+static void esp8266_apply_boot_state(Esp8266SocState *s)
+{
+    CPUState *cs = CPU(&s->cpu[0]);
+
+    if (!s->boot_loaded) {
+        return;
+    }
+
+    s->cpu[0].env.sregs[PS] = 0;
+    s->cpu[0].env.regs[1] = ESP8266_DRAM_BASE + ESP8266_DRAM_SIZE;
+    cpu_set_pc(cs, s->boot_entry);
+    cs->exception_index = -1;
+    xtensa_runstall(&s->cpu[0].env, false);
+}
+
+static void esp8266_boot_reset(void *opaque)
+{
+    esp8266_apply_boot_state(opaque);
+}
+
+static void esp8266_init_rom_stubs(Esp8266SocState *s)
+{
+    uint8_t *rom = memory_region_get_ram_ptr(&s->rom);
+
+    /*
+     * Early ESP8266 eboot images call a small set of ROM helpers before the
+     * SDK starts. A ret.n-filled ROM window keeps those calls non-fatal until
+     * individual helpers need modeled behavior.
+     */
+    for (size_t i = 0; i < ESP8266_ROM_SIZE; i += 2) {
+        rom[i] = 0x0d;
+        rom[i + 1] = 0xf0;
+    }
+}
+
 static void esp8266_soc_init(Object *obj)
 {
     Esp8266SocState *s = ESP8266_SOC(obj);
@@ -98,8 +137,9 @@ static void esp8266_soc_realize(DeviceState *dev, Error **errp)
     }
 
     /* DRAM: 0x3FFE8000 (80KB) */
-    memory_region_init_ram(&s->dram, OBJECT(dev), "esp8266.dram", 80 * KiB, &error_fatal);
-    memory_region_add_subregion(system_memory, 0x3ffe8000, &s->dram);
+    memory_region_init_ram(&s->dram, OBJECT(dev), "esp8266.dram",
+                           ESP8266_DRAM_SIZE, &error_fatal);
+    memory_region_add_subregion(system_memory, ESP8266_DRAM_BASE, &s->dram);
 
     /*
      * IRAM: SDK eboot images commonly place their first segment at
@@ -107,6 +147,11 @@ static void esp8266_soc_realize(DeviceState *dev, Error **errp)
      */
     memory_region_init_ram(&s->iram, OBJECT(dev), "esp8266.iram", 64 * KiB, &error_fatal);
     memory_region_add_subregion(system_memory, 0x40100000, &s->iram);
+
+    memory_region_init_ram(&s->rom, OBJECT(dev), "esp8266.rom",
+                           ESP8266_ROM_SIZE, &error_fatal);
+    memory_region_add_subregion(system_memory, ESP8266_ROM_BASE, &s->rom);
+    esp8266_init_rom_stubs(s);
 
     /* IROM (Mapped from Flash): 0x40200000 (1MB typical) */
     memory_region_init_ram(&s->irom, OBJECT(dev), "esp8266.irom", 1 * MiB, &error_fatal);
@@ -129,6 +174,7 @@ static void esp8266_soc_realize(DeviceState *dev, Error **errp)
     create_unimplemented_device("esp8266.gpio",  0x60000300, 0x100);
     create_unimplemented_device("esp8266.timer", 0x60000600, 0x100);
     create_unimplemented_device("esp8266.rtc",   0x60000700, 0x100);
+    create_unimplemented_device("esp8266.iomux", 0x60001200, 0x100);
 }
 
 static void esp8266_soc_class_init(ObjectClass *oc, void *data)
@@ -201,7 +247,6 @@ static bool esp8266_load_image_segments(const uint8_t *data, size_t len,
 static void esp8266_load_flash_image(Esp8266SocState *s, const uint8_t *data,
                                      size_t len, const char *name)
 {
-    CPUState *cs = CPU(&s->cpu[0]);
     uint32_t entry = ESP8266_FLASH_BASE;
 
     esp8266_load_raw_flash(s, data, len);
@@ -215,9 +260,9 @@ static void esp8266_load_flash_image(Esp8266SocState *s, const uint8_t *data,
 
     esp8266_uart_puts(s, "rst:0x1 (POWERON_RESET),boot:0x0 (qemu)\r\n");
     esp8266_uart_puts(s, "eboot: qemu minimal ESP8266 image loader\r\n");
-    s->cpu[0].env.sregs[PS] = 0;
-    cpu_set_pc(cs, entry);
-    cs->exception_index = -1;
+    s->boot_entry = entry;
+    s->boot_loaded = true;
+    esp8266_apply_boot_state(s);
 }
 
 static void esp8266_machine_init(MachineState *machine)
@@ -234,6 +279,8 @@ static void esp8266_machine_init(MachineState *machine)
 
     sysbus_realize_and_unref(SYS_BUS_DEVICE(soc), &error_fatal);
     ss = ESP8266_SOC(soc);
+    qemu_register_reset(esp8266_boot_reset, ss);
+    cpu_reset(CPU(&ss->cpu[0]));
 
     if (machine->kernel_filename) {
         gsize len = 0;
