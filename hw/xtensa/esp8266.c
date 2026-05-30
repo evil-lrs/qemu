@@ -215,7 +215,9 @@ static void esp8266_load_flash_image(Esp8266SocState *s, const uint8_t *data,
 
     esp8266_uart_puts(s, "rst:0x1 (POWERON_RESET),boot:0x0 (qemu)\r\n");
     esp8266_uart_puts(s, "eboot: qemu minimal ESP8266 image loader\r\n");
+    s->cpu[0].env.sregs[PS] = 0;
     cpu_set_pc(cs, entry);
+    cs->exception_index = -1;
 }
 
 static void esp8266_machine_init(MachineState *machine)
