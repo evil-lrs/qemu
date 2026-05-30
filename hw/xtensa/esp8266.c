@@ -66,6 +66,9 @@
 #define ESP8266_WIFI_BOOT_MAGIC 0x0d74
 #define ESP8266_WIFI_STATUS 0x0800
 #define ESP8266_WIFI_STATUS_READY (10u << 16)
+#define ESP8266_TIMER_STATUS 0x128
+#define ESP8266_TIMER_STATUS_READY 0x1
+#define ESP8266_RTC_TIMER_STATUS (ESP8266_TIMER_STATUS - 0x100)
 
 static uint64_t esp8266_dport_read(void *opaque, hwaddr addr,
                                    unsigned int size)
@@ -239,6 +242,9 @@ static uint64_t esp8266_timer_read(void *opaque, hwaddr addr, unsigned int size)
 {
     Esp8266SocState *s = opaque;
 
+    if (addr == ESP8266_TIMER_STATUS) {
+        return s->timer_regs[addr / 4] | ESP8266_TIMER_STATUS_READY;
+    }
     if (addr < sizeof(s->timer_regs) && (addr % 4) == 0) {
         return s->timer_regs[addr / 4];
     }
@@ -269,6 +275,9 @@ static uint64_t esp8266_rtc_read(void *opaque, hwaddr addr, unsigned int size)
 {
     Esp8266SocState *s = opaque;
 
+    if (addr == ESP8266_RTC_TIMER_STATUS) {
+        return s->rtc_regs[addr / 4] | ESP8266_TIMER_STATUS_READY;
+    }
     if (addr < sizeof(s->rtc_regs) && (addr % 4) == 0) {
         return s->rtc_regs[addr / 4];
     }
@@ -551,8 +560,12 @@ static void esp8266_soc_realize(DeviceState *dev, Error **errp)
     memory_region_add_subregion(system_memory, 0x60000200, &s->spi);
 
     memory_region_init_io(&s->i2c, OBJECT(dev), &esp8266_i2c_ops, s,
-                          "esp8266.i2c", 0x400);
+                          "esp8266.i2c", 0x800);
     memory_region_add_subregion(system_memory, 0x60000a00, &s->i2c);
+
+    memory_region_init_io(&s->timer0, OBJECT(dev), &esp8266_timer_ops, s,
+                          "esp8266.timer0", 0x100);
+    memory_region_add_subregion(system_memory, 0x60000500, &s->timer0);
 
     memory_region_init_io(&s->timer, OBJECT(dev), &esp8266_timer_ops, s,
                           "esp8266.timer", 0x300);

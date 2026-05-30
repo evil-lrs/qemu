@@ -9,7 +9,7 @@
 #define ESP8266_CPU_COUNT 1
 #define ESP8266_GPIO_MMIO_WORDS (0x100 / 4)
 #define ESP8266_SPI_MMIO_WORDS (0x100 / 4)
-#define ESP8266_I2C_MMIO_WORDS (0x400 / 4)
+#define ESP8266_I2C_MMIO_WORDS (0x800 / 4)
 #define ESP8266_TIMER_MMIO_WORDS (0x300 / 4)
 #define ESP8266_RTC_MMIO_WORDS (0x100 / 4)
 #define ESP8266_IOMUX_MMIO_WORDS (0x100 / 4)
@@ -29,6 +29,7 @@ typedef struct Esp8266SocState {
     MemoryRegion gpio;
     MemoryRegion spi;
     MemoryRegion i2c;
+    MemoryRegion timer0;
     MemoryRegion timer;
     MemoryRegion rtc;
     MemoryRegion iomux;
