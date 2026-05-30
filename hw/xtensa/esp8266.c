@@ -15,8 +15,11 @@
 #include "hw/xtensa/xtensa_memory.h"
 #include "hw/misc/unimp.h"
 #include "hw/misc/esp_radio_config.h"
+#include "hw/misc/esp_radio_board.h"
+#include "hw/ssi/sx127x.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
+#include "hw/qdev-properties-system.h"
 #include "hw/xtensa/esp8266.h"
 #include "core-lx106/core-isa.h"
 #include "chardev/char-fe.h"
@@ -40,8 +43,10 @@
 #define ESP8266_ROM_BASE 0x40000000
 #define ESP8266_ROM_SIZE (64 * KiB)
 #define ESP8266_ROM_CACHE_READ_ENABLE 0x4000242c
+#define ESP8266_ROM_ETS_VPRINTF 0x40001f00
 #define ESP8266_ROM_ETS_PRINTF 0x400024cc
 #define ESP8266_ROM_ETS_PUTC 0x40002be8
+#define ESP8266_ROM_ETS_STRLEN 0x40002ac8
 #define ESP8266_ROM_SPI_READ 0x40004b1c
 #define ESP8266_ROM_MUL_OVERFLOW_CHECK 0x4000dcf0
 #define ESP8266_ROM_FLASH_SECTOR_COUNT 0x4000e21c
@@ -54,6 +59,11 @@
 #define ESP8266_IMAGE_MAGIC 0xe9
 #define ESP8266_UART_FIFO 0x00
 #define ESP8266_UART_STATUS 0x1c
+#define ESP8266_SPI_CMD 0x00
+#define ESP8266_HSPI_CMD 0x00
+#define ESP8266_HSPI_USER1 0x20
+#define ESP8266_HSPI_W0 0x40
+#define ESP8266_HSPI_USR BIT(18)
 #define ESP8266_DPORT_OTP_MAC0 0x50
 #define ESP8266_DPORT_OTP_MAC1 0x54
 #define ESP8266_DPORT_OTP_MAC2 0x58
@@ -139,6 +149,69 @@ static const MemoryRegionOps esp8266_uart_ops = {
     },
 };
 
+static void esp8266_hspi_transfer(Esp8266SocState *s)
+{
+    uint32_t user1 = s->hspi_regs[ESP8266_HSPI_USER1 / 4];
+    uint32_t bitlen = ((user1 >> 17) & 0x1ff) + 1;
+    uint32_t bytes = DIV_ROUND_UP(bitlen, 8);
+    uint8_t *buf = (uint8_t *)&s->hspi_regs[ESP8266_HSPI_W0 / 4];
+
+    if (!s->hspi_bus || bytes == 0) {
+        return;
+    }
+
+    if (s->hspi_cs) {
+        qemu_set_irq(s->hspi_cs, 0);
+    }
+    for (uint32_t i = 0; i < bytes && i < 64; i++) {
+        buf[i] = ssi_transfer(s->hspi_bus, buf[i]) & 0xff;
+    }
+    if (s->hspi_cs) {
+        qemu_set_irq(s->hspi_cs, 1);
+    }
+}
+
+static uint64_t esp8266_hspi_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    Esp8266SocState *s = opaque;
+
+    if (addr < sizeof(s->hspi_regs) && (addr % 4) == 0) {
+        return s->hspi_regs[addr / 4];
+    }
+    return 0;
+}
+
+static void esp8266_hspi_write(void *opaque, hwaddr addr, uint64_t value,
+                               unsigned int size)
+{
+    Esp8266SocState *s = opaque;
+
+    if (addr >= sizeof(s->hspi_regs) || (addr % 4) != 0) {
+        return;
+    }
+
+    if (addr == ESP8266_HSPI_CMD) {
+        s->hspi_regs[addr / 4] = value;
+        if (value & ESP8266_HSPI_USR) {
+            esp8266_hspi_transfer(s);
+        }
+        s->hspi_regs[addr / 4] = 0;
+        return;
+    }
+
+    s->hspi_regs[addr / 4] = value;
+}
+
+static const MemoryRegionOps esp8266_hspi_ops = {
+    .read = esp8266_hspi_read,
+    .write = esp8266_hspi_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
 static uint64_t esp8266_gpio_read(void *opaque, hwaddr addr, unsigned int size)
 {
     Esp8266SocState *s = opaque;
@@ -187,6 +260,14 @@ static void esp8266_spi_write(void *opaque, hwaddr addr, uint64_t value,
 {
     Esp8266SocState *s = opaque;
 
+    if (addr == ESP8266_SPI_CMD) {
+        /*
+         * SDK startup issues short SPI flash commands and then polls SPI_CMD
+         * until the command bits self-clear. Complete them synchronously.
+         */
+        s->spi_regs[addr / 4] = 0;
+        return;
+    }
     if (addr < sizeof(s->spi_regs) && (addr % 4) == 0) {
         s->spi_regs[addr / 4] = value;
     }
@@ -335,6 +416,36 @@ static const MemoryRegionOps esp8266_iomux_ops = {
     },
 };
 
+static uint64_t esp8266_sys_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    Esp8266SocState *s = opaque;
+
+    if (addr < sizeof(s->sys_regs) && (addr % 4) == 0) {
+        return s->sys_regs[addr / 4];
+    }
+    return 0;
+}
+
+static void esp8266_sys_write(void *opaque, hwaddr addr, uint64_t value,
+                              unsigned int size)
+{
+    Esp8266SocState *s = opaque;
+
+    if (addr < sizeof(s->sys_regs) && (addr % 4) == 0) {
+        s->sys_regs[addr / 4] = value;
+    }
+}
+
+static const MemoryRegionOps esp8266_sys_ops = {
+    .read = esp8266_sys_read,
+    .write = esp8266_sys_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
 static uint64_t esp8266_wifi_read(void *opaque, hwaddr addr, unsigned int size)
 {
     Esp8266SocState *s = opaque;
@@ -432,6 +543,15 @@ static void esp8266_init_rom_stubs(Esp8266SocState *s)
         0x0c, 0x02,             /* movi.n a2, 0 */
         0x0d, 0xf0,             /* ret.n */
     };
+    static const uint8_t ets_strlen[] = {
+        0x3d, 0x02,             /* mov.n a3, a2 */
+        0x42, 0x03, 0x00,       /* loop: l8ui a4, a3, 0 */
+        0x8c, 0x34,             /* beqz.n a4, done */
+        0x1b, 0x33,             /* addi.n a3, a3, 1 */
+        0x46, 0xfd, 0xff,       /* j loop */
+        0x20, 0x23, 0xc0,       /* done: sub a2, a3, a2 */
+        0x0d, 0xf0,             /* ret.n */
+    };
     static const uint8_t cache_read_enable[] = {
         0xa0, 0x02, 0x00,       /* jx a2 */
     };
@@ -489,6 +609,10 @@ static void esp8266_init_rom_stubs(Esp8266SocState *s)
 
     memcpy(rom + ESP8266_ROM_ETS_PRINTF - ESP8266_ROM_BASE, ets_printf,
            sizeof(ets_printf));
+    memcpy(rom + ESP8266_ROM_ETS_VPRINTF - ESP8266_ROM_BASE, ets_printf,
+           sizeof(ets_printf));
+    memcpy(rom + ESP8266_ROM_ETS_STRLEN - ESP8266_ROM_BASE, ets_strlen,
+           sizeof(ets_strlen));
     memcpy(rom + ESP8266_ROM_CACHE_READ_ENABLE - ESP8266_ROM_BASE,
            cache_read_enable, sizeof(cache_read_enable));
     memcpy(rom + ESP8266_ROM_ETS_PUTC - ESP8266_ROM_BASE - 4, ets_putc,
@@ -558,6 +682,11 @@ static void esp8266_soc_realize(DeviceState *dev, Error **errp)
                           "esp8266.uart0", 0x100);
     memory_region_add_subregion(system_memory, 0x60000000, &s->uart0);
 
+    s->hspi_bus = ssi_create_bus(DEVICE(s), "hspi");
+    memory_region_init_io(&s->hspi, OBJECT(dev), &esp8266_hspi_ops, s,
+                          "esp8266.hspi", 0x100);
+    memory_region_add_subregion(system_memory, 0x60000100, &s->hspi);
+
     memory_region_init_io(&s->gpio, OBJECT(dev), &esp8266_gpio_ops, s,
                           "esp8266.gpio", 0x100);
     memory_region_add_subregion(system_memory, 0x60000300, &s->gpio);
@@ -585,6 +714,10 @@ static void esp8266_soc_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->iomux, OBJECT(dev), &esp8266_iomux_ops, s,
                           "esp8266.iomux", 0x100);
     memory_region_add_subregion(system_memory, 0x60001200, &s->iomux);
+
+    memory_region_init_io(&s->sys, OBJECT(dev), &esp8266_sys_ops, s,
+                          "esp8266.sys", 0x100);
+    memory_region_add_subregion(system_memory, 0x60000900, &s->sys);
 
     memory_region_init_io(&s->wifi, OBJECT(dev), &esp8266_wifi_ops, s,
                           "esp8266.wifi", 0x2000);
@@ -679,22 +812,73 @@ static void esp8266_load_flash_image(Esp8266SocState *s, const uint8_t *data,
     esp8266_apply_boot_state(s);
 }
 
+static void esp8266_machine_init_radios(Esp8266SocState *ss,
+                                        const EspRadioBoardConfig *cfg,
+                                        const char *air_chardev_name)
+{
+    sx127x_linker_anchor();
+
+    if (!cfg || cfg->type == ESP_RADIO_NONE) {
+        return;
+    }
+
+    if (cfg->type != ESP_RADIO_SX127X || cfg->spi_bus != 2) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP8266: unsupported radio config type=%s spi=%d; "
+                      "only sx127x on HSPI/radio_spi=2 is wired\n",
+                      esp_radio_type_str(cfg->type), cfg->spi_bus);
+        return;
+    }
+
+    Chardev *air_chr = NULL;
+    if (air_chardev_name) {
+        air_chr = qemu_chr_find(air_chardev_name);
+        if (!air_chr) {
+            error_report("Error: chardev '%s' not found for radio-air-chardev",
+                         air_chardev_name);
+        }
+    }
+
+    DeviceState *radio = qdev_new(TYPE_SX127X);
+    object_property_add_child(OBJECT(ss), "radio-hspi-cs0", OBJECT(radio));
+    qdev_prop_set_uint8(radio, "spi_id", 2);
+    qdev_prop_set_uint8(radio, "cs", 0);
+    if (air_chr) {
+        qdev_prop_set_chr(radio, "air-chardev", air_chr);
+    }
+    qdev_realize_and_unref(radio, BUS(ss->hspi_bus), &error_fatal);
+    ss->hspi_cs = qdev_get_gpio_in_named(radio, SSI_GPIO_CS, 0);
+
+    qemu_set_irq(ss->hspi_cs, 1);
+    qemu_log("ESP8266 radio board: type=sx127x spi=2 nss=%d dio0=%d dio1=%d\n",
+             cfg->chips[0].nss, cfg->chips[0].dio0, cfg->chips[0].dio1);
+}
+
 static void esp8266_machine_init(MachineState *machine)
 {
     Esp8266MachineState *ms = ESP8266_MACHINE(machine);
     DeviceState *soc = qdev_new(TYPE_ESP8266_SOC);
     Esp8266SocState *ss;
+    EspRadioBoardConfig radio_cfg;
+    bool have_radio_cfg = false;
 
     esp_radio_config_log("ESP8266", ms->radio_config);
     if (ms->radio_config) {
-        qemu_log("ESP8266: radio-config accepted for validation metadata; "
-                 "radio SSI wiring is not implemented yet\n");
+        Error *err = NULL;
+
+        have_radio_cfg = esp_radio_board_config_load(ms->radio_config,
+                                                     &radio_cfg, &err);
+        if (!have_radio_cfg) {
+            error_report_err(err);
+        }
     }
 
     sysbus_realize_and_unref(SYS_BUS_DEVICE(soc), &error_fatal);
     ss = ESP8266_SOC(soc);
     qemu_register_reset(esp8266_boot_reset, ss);
     cpu_reset(CPU(&ss->cpu[0]));
+    esp8266_machine_init_radios(ss, have_radio_cfg ? &radio_cfg : NULL,
+                                ms->radio_air_chardev);
 
     if (machine->kernel_filename) {
         gsize len = 0;
