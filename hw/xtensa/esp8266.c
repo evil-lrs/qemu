@@ -43,6 +43,7 @@
 #define ESP8266_ROM_ETS_PRINTF 0x400024cc
 #define ESP8266_ROM_ETS_PUTC 0x40002be8
 #define ESP8266_ROM_SPI_READ 0x40004b1c
+#define ESP8266_ROM_MUL_OVERFLOW_CHECK 0x4000dcf0
 #define ESP8266_ROM_FLASH_SECTOR_COUNT 0x4000e21c
 #define ESP8266_ROM_FLASHCHIP 0x3fffc714
 #define ESP8266_ROM_FLASHCHIP_DATA 0x3fffc718
@@ -471,6 +472,10 @@ static void esp8266_init_rom_stubs(Esp8266SocState *s)
         0x2a, 0x22,             /* add.n a2, a2, a2 */
         0x0d, 0xf0,             /* ret.n */
     };
+    static const uint8_t mul_overflow_check[] = {
+        0x0c, 0x03,             /* movi.n a3, 0 */
+        0x0d, 0xf0,             /* ret.n */
+    };
 
     /*
      * Early ESP8266 eboot images call a small set of ROM helpers before the
@@ -492,6 +497,8 @@ static void esp8266_init_rom_stubs(Esp8266SocState *s)
            sizeof(spi_read));
     memcpy(rom + ESP8266_ROM_FLASH_SECTOR_COUNT - ESP8266_ROM_BASE,
            flash_sector_count, sizeof(flash_sector_count));
+    memcpy(rom + ESP8266_ROM_MUL_OVERFLOW_CHECK - ESP8266_ROM_BASE,
+           mul_overflow_check, sizeof(mul_overflow_check));
 }
 
 static void esp8266_soc_init(Object *obj)
