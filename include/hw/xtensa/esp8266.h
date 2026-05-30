@@ -12,6 +12,7 @@ typedef struct Esp8266SocState {
     SysBusDevice parent_obj;
 
     MemoryRegion dram;
+    MemoryRegion dport;
     MemoryRegion iram;
     MemoryRegion rom;
     MemoryRegion irom;

@@ -34,12 +34,42 @@
 #define ESP8266_FLASH_BASE 0x40200000
 #define ESP8266_FLASH_SIZE (1 * MiB)
 #define ESP8266_DRAM_BASE 0x3ffe8000
-#define ESP8266_DRAM_SIZE (80 * KiB)
+#define ESP8266_DRAM_SIZE (96 * KiB)
 #define ESP8266_ROM_BASE 0x40000000
 #define ESP8266_ROM_SIZE (64 * KiB)
+#define ESP8266_ROM_ETS_PRINTF 0x400024cc
+#define ESP8266_ROM_ETS_PUTC 0x40002be8
+#define ESP8266_ROM_SPI_READ 0x40004b1c
 #define ESP8266_IMAGE_MAGIC 0xe9
 #define ESP8266_UART_FIFO 0x00
 #define ESP8266_UART_STATUS 0x1c
+#define ESP8266_DPORT_CHIP_ID 0x58
+
+static uint64_t esp8266_dport_read(void *opaque, hwaddr addr,
+                                   unsigned int size)
+{
+    switch (addr) {
+    case ESP8266_DPORT_CHIP_ID:
+        return 1u << 15;
+    default:
+        return 0;
+    }
+}
+
+static void esp8266_dport_write(void *opaque, hwaddr addr, uint64_t value,
+                                unsigned int size)
+{
+}
+
+static const MemoryRegionOps esp8266_dport_ops = {
+    .read = esp8266_dport_read,
+    .write = esp8266_dport_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
 
 static uint64_t esp8266_uart_read(void *opaque, hwaddr addr, unsigned int size)
 {
@@ -109,16 +139,48 @@ static void esp8266_boot_reset(void *opaque)
 static void esp8266_init_rom_stubs(Esp8266SocState *s)
 {
     uint8_t *rom = memory_region_get_ram_ptr(&s->rom);
+    static const uint8_t ets_printf[] = {
+        0x0c, 0x02,             /* movi.n a2, 0 */
+        0x0d, 0xf0,             /* ret.n */
+    };
+    static const uint8_t ets_putc[] = {
+        0x00, 0x00, 0x00, 0x60, /* literal: UART0 FIFO */
+        0x31, 0xff, 0xff,       /* l32r a3, . - 4 */
+        0xc0, 0x20, 0x00,       /* memw */
+        0x29, 0x03,             /* s32i.n a2, a3, 0 */
+        0x0d, 0xf0,             /* ret.n */
+    };
+    static const uint8_t spi_read[] = {
+        0x00, 0x00, 0x20, 0x40, /* literal: mapped flash base */
+        0x51, 0xff, 0xff,       /* l32r a5, . - 4 */
+        0x2a, 0x55,             /* add.n a5, a5, a2 */
+        0x8c, 0xd4,             /* beqz.n a4, done */
+        0x62, 0x05, 0x00,       /* l8ui a6, a5, 0 */
+        0x62, 0x43, 0x00,       /* s8i a6, a3, 0 */
+        0x1b, 0x55,             /* addi.n a5, a5, 1 */
+        0x1b, 0x33,             /* addi.n a3, a3, 1 */
+        0x0b, 0x44,             /* addi.n a4, a4, -1 */
+        0x86, 0xfb, 0xff,       /* j loop */
+        0x0c, 0x02,             /* movi.n a2, 0 */
+        0x0d, 0xf0,             /* ret.n */
+    };
 
     /*
      * Early ESP8266 eboot images call a small set of ROM helpers before the
-     * SDK starts. A ret.n-filled ROM window keeps those calls non-fatal until
-     * individual helpers need modeled behavior.
+     * SDK starts. Fill the window with ret.n, then patch the helpers needed to
+     * load the next flash stage.
      */
     for (size_t i = 0; i < ESP8266_ROM_SIZE; i += 2) {
         rom[i] = 0x0d;
         rom[i + 1] = 0xf0;
     }
+
+    memcpy(rom + ESP8266_ROM_ETS_PRINTF - ESP8266_ROM_BASE, ets_printf,
+           sizeof(ets_printf));
+    memcpy(rom + ESP8266_ROM_ETS_PUTC - ESP8266_ROM_BASE - 4, ets_putc,
+           sizeof(ets_putc));
+    memcpy(rom + ESP8266_ROM_SPI_READ - ESP8266_ROM_BASE - 4, spi_read,
+           sizeof(spi_read));
 }
 
 static void esp8266_soc_init(Object *obj)
@@ -153,6 +215,10 @@ static void esp8266_soc_realize(DeviceState *dev, Error **errp)
     memory_region_add_subregion(system_memory, ESP8266_ROM_BASE, &s->rom);
     esp8266_init_rom_stubs(s);
 
+    memory_region_init_io(&s->dport, OBJECT(dev), &esp8266_dport_ops, s,
+                          "esp8266.dport", 0x100);
+    memory_region_add_subregion(system_memory, 0x3ff00000, &s->dport);
+
     /* IROM (Mapped from Flash): 0x40200000 (1MB typical) */
     memory_region_init_ram(&s->irom, OBJECT(dev), "esp8266.irom", 1 * MiB, &error_fatal);
     memory_region_add_subregion(system_memory, 0x40200000, &s->irom);
@@ -174,7 +240,9 @@ static void esp8266_soc_realize(DeviceState *dev, Error **errp)
     create_unimplemented_device("esp8266.gpio",  0x60000300, 0x100);
     create_unimplemented_device("esp8266.timer", 0x60000600, 0x100);
     create_unimplemented_device("esp8266.rtc",   0x60000700, 0x100);
+    create_unimplemented_device("esp8266.i2c",   0x60000a00, 0x400);
     create_unimplemented_device("esp8266.iomux", 0x60001200, 0x100);
+    create_unimplemented_device("esp8266.wifi",  0x60009000, 0x2000);
 }
 
 static void esp8266_soc_class_init(ObjectClass *oc, void *data)
