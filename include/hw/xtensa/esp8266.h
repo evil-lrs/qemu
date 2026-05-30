@@ -8,7 +8,9 @@
 
 #define ESP8266_CPU_COUNT 1
 #define ESP8266_GPIO_MMIO_WORDS (0x100 / 4)
+#define ESP8266_SPI_MMIO_WORDS (0x100 / 4)
 #define ESP8266_I2C_MMIO_WORDS (0x400 / 4)
+#define ESP8266_TIMER_MMIO_WORDS (0x300 / 4)
 #define ESP8266_RTC_MMIO_WORDS (0x100 / 4)
 #define ESP8266_IOMUX_MMIO_WORDS (0x100 / 4)
 #define ESP8266_WIFI_MMIO_WORDS (0x2000 / 4)
@@ -25,7 +27,9 @@ typedef struct Esp8266SocState {
     MemoryRegion drom;
     MemoryRegion uart0;
     MemoryRegion gpio;
+    MemoryRegion spi;
     MemoryRegion i2c;
+    MemoryRegion timer;
     MemoryRegion rtc;
     MemoryRegion iomux;
     MemoryRegion wifi;
@@ -33,7 +37,9 @@ typedef struct Esp8266SocState {
     CharBackend uart0_chr;
     XtensaCPU cpu[ESP8266_CPU_COUNT];
     uint32_t gpio_regs[ESP8266_GPIO_MMIO_WORDS];
+    uint32_t spi_regs[ESP8266_SPI_MMIO_WORDS];
     uint32_t i2c_regs[ESP8266_I2C_MMIO_WORDS];
+    uint32_t timer_regs[ESP8266_TIMER_MMIO_WORDS];
     uint32_t rtc_regs[ESP8266_RTC_MMIO_WORDS];
     uint32_t iomux_regs[ESP8266_IOMUX_MMIO_WORDS];
     uint32_t wifi_regs[ESP8266_WIFI_MMIO_WORDS];
