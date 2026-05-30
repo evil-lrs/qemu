@@ -1,6 +1,7 @@
 #pragma once
 
 #include "exec/hwaddr.h"
+#include "hw/irq.h"
 
 /*
  * Thin stateful backing for ESP32 peripheral regions that aren't
@@ -32,3 +33,13 @@ void esp32_wifi_stub_add_region_self_clear(const char *name,
                                            hwaddr apb_base, size_t size,
                                            uint32_t default_val,
                                            uint32_t self_clear_mask);
+
+/*
+ * Same stateful backing, plus a minimal I2S TX-DMA completion model.
+ * Writes that start the output link or TX engine latch OUT_DONE/OUT_EOF
+ * status and pulse @irq.  This is enough for IDF's I2S-backed WS2812
+ * path to observe completion without modelling audio samples.
+ */
+void esp32_wifi_stub_add_i2s_region(const char *name, hwaddr dport_base,
+                                    hwaddr apb_base, size_t size,
+                                    uint32_t default_val, qemu_irq irq);

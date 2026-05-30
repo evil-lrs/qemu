@@ -25,6 +25,8 @@
 #include "hw/char/esp32_uart.h"
 #include "trace.h"
 
+#define UART_CONF0_RXFIFO_RST BIT(17)
+#define UART_CONF0_TXFIFO_RST BIT(18)
 
 static gboolean uart_transmit(void *do_not_use, GIOCondition cond, void *opaque);
 static void uart_receive(void *opaque, const uint8_t *buf, int size);
@@ -91,6 +93,9 @@ static uint64_t uart_read(void *opaque, hwaddr addr, unsigned int size)
         break;
 
     case A_UART_STATUS:
+        if (fifo8_num_used(&s->tx_fifo) > 0) {
+            uart_transmit(NULL, G_IO_OUT, s);
+        }
         r = FIELD_DP32(r, UART_STATUS, RXFIFO_CNT, fifo8_num_used(&s->rx_fifo));
         r = FIELD_DP32(r, UART_STATUS, TXFIFO_CNT, fifo8_num_used(&s->tx_fifo));
         break;
@@ -158,6 +163,17 @@ static void uart_write(void *opaque, hwaddr addr,
 
     case A_UART_INT_ENA:
         s->reg[addr / 4] = value;
+        break;
+
+    case A_UART_CONF0:
+        if (value & UART_CONF0_TXFIFO_RST) {
+            fifo8_reset(&s->tx_fifo);
+        }
+        if (value & UART_CONF0_RXFIFO_RST) {
+            fifo8_reset(&s->rx_fifo);
+        }
+        s->reg[addr / 4] =
+            value & ~(UART_CONF0_TXFIFO_RST | UART_CONF0_RXFIFO_RST);
         break;
 
     case A_UART_CLKDIV: {

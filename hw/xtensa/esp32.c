@@ -597,12 +597,18 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
      * polled for status bits the same way as the BB/FE regions.  Route
      * them through the stateful wifi-stub so any "wait for ready"
      * loops unblock without us enumerating each bit. */
+#define ESP32_I2S_STUB(name_, base_, source_) \
+    esp32_wifi_stub_add_i2s_region((name_), (base_), \
+                                   (base_) - DR_REG_DPORT_APB_BASE + APB_REG_BASE, \
+                                   0x1000, 0xffffffff, \
+                                   qdev_get_gpio_in(intmatrix_dev, (source_)))
+    ESP32_I2S_STUB("esp32.i2s0",  DR_REG_I2S_BASE,  ETS_I2S0_INTR_SOURCE);
+    ESP32_I2S_STUB("esp32.i2s1",  DR_REG_I2S1_BASE, ETS_I2S1_INTR_SOURCE);
+#undef ESP32_I2S_STUB
 #define ESP32_WIFI_STUB(name_, base_, size_, default_) \
     esp32_wifi_stub_add_region((name_), (base_), \
                                (base_) - DR_REG_DPORT_APB_BASE + APB_REG_BASE, \
                                (size_), (default_))
-    ESP32_WIFI_STUB("esp32.i2s0",  DR_REG_I2S_BASE,  0x1000, 0xffffffff);
-    ESP32_WIFI_STUB("esp32.i2s1",  DR_REG_I2S1_BASE, 0x1000, 0xffffffff);
     ESP32_WIFI_STUB("esp32.rmt",   DR_REG_RMT_BASE,  0x1000, 0xffffffff);
     ESP32_WIFI_STUB("esp32.pcnt",  DR_REG_PCNT_BASE, 0x1000, 0xffffffff);
     /* Keep mcpwm at 0x8000 — chipv7_phy/WIFI/PHYA/WDEV stubs and

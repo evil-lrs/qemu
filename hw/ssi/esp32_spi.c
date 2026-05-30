@@ -45,7 +45,7 @@ static void esp32_spi_do_command(Esp32SpiState* state, uint32_t cmd_reg);
 
 static bool esp32_spi_debug(Esp32SpiState *s)
 {
-    return s->id >= 1;
+    return s->id >= 2;
 }
 
 static const char *esp32_spi_reg_name(hwaddr addr)
