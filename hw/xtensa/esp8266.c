@@ -35,15 +35,23 @@
 #define ESP8266_FLASH_SIZE (1 * MiB)
 #define ESP8266_DRAM_BASE 0x3ffe8000
 #define ESP8266_DRAM_SIZE (96 * KiB)
+#define ESP8266_SRAM_BASE 0x3ff00000
+#define ESP8266_SRAM_SIZE (256 * KiB)
 #define ESP8266_ROM_BASE 0x40000000
 #define ESP8266_ROM_SIZE (64 * KiB)
+#define ESP8266_ROM_CACHE_READ_ENABLE 0x4000242c
 #define ESP8266_ROM_ETS_PRINTF 0x400024cc
 #define ESP8266_ROM_ETS_PUTC 0x40002be8
 #define ESP8266_ROM_SPI_READ 0x40004b1c
 #define ESP8266_IMAGE_MAGIC 0xe9
 #define ESP8266_UART_FIFO 0x00
 #define ESP8266_UART_STATUS 0x1c
+#define ESP8266_DPORT_OTP0 0x50
+#define ESP8266_DPORT_OTP1 0x54
 #define ESP8266_DPORT_CHIP_ID 0x58
+#define ESP8266_DPORT_CHIP_ID_ESP8285 0
+#define ESP8266_GPIO_IN 0x18
+#define ESP8266_GPIO_BOOT_STRAPS ((1u << 0) | (1u << 2))
 #define ESP8266_I2C_CLOCK_GATE 0x348
 #define ESP8266_WIFI_BOOT_MAGIC 0x0d74
 #define ESP8266_WIFI_STATUS 0x0800
@@ -53,8 +61,12 @@ static uint64_t esp8266_dport_read(void *opaque, hwaddr addr,
                                    unsigned int size)
 {
     switch (addr) {
+    case ESP8266_DPORT_OTP0:
+        return 1;
+    case ESP8266_DPORT_OTP1:
+        return 1;
     case ESP8266_DPORT_CHIP_ID:
-        return 1u << 15;
+        return ESP8266_DPORT_CHIP_ID_ESP8285;
     default:
         return 0;
     }
@@ -111,6 +123,39 @@ static const MemoryRegionOps esp8266_uart_ops = {
     },
 };
 
+static uint64_t esp8266_gpio_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    Esp8266SocState *s = opaque;
+
+    if (addr == ESP8266_GPIO_IN) {
+        return s->gpio_regs[addr / 4] | ESP8266_GPIO_BOOT_STRAPS;
+    }
+    if (addr < sizeof(s->gpio_regs) && (addr % 4) == 0) {
+        return s->gpio_regs[addr / 4];
+    }
+    return 0;
+}
+
+static void esp8266_gpio_write(void *opaque, hwaddr addr, uint64_t value,
+                               unsigned int size)
+{
+    Esp8266SocState *s = opaque;
+
+    if (addr < sizeof(s->gpio_regs) && (addr % 4) == 0) {
+        s->gpio_regs[addr / 4] = value;
+    }
+}
+
+static const MemoryRegionOps esp8266_gpio_ops = {
+    .read = esp8266_gpio_read,
+    .write = esp8266_gpio_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
 static uint64_t esp8266_i2c_read(void *opaque, hwaddr addr, unsigned int size)
 {
     Esp8266SocState *s = opaque;
@@ -141,6 +186,66 @@ static void esp8266_i2c_write(void *opaque, hwaddr addr, uint64_t value,
 static const MemoryRegionOps esp8266_i2c_ops = {
     .read = esp8266_i2c_read,
     .write = esp8266_i2c_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
+static uint64_t esp8266_rtc_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    Esp8266SocState *s = opaque;
+
+    if (addr < sizeof(s->rtc_regs) && (addr % 4) == 0) {
+        return s->rtc_regs[addr / 4];
+    }
+    return 0;
+}
+
+static void esp8266_rtc_write(void *opaque, hwaddr addr, uint64_t value,
+                              unsigned int size)
+{
+    Esp8266SocState *s = opaque;
+
+    if (addr < sizeof(s->rtc_regs) && (addr % 4) == 0) {
+        s->rtc_regs[addr / 4] = value;
+    }
+}
+
+static const MemoryRegionOps esp8266_rtc_ops = {
+    .read = esp8266_rtc_read,
+    .write = esp8266_rtc_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
+static uint64_t esp8266_iomux_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    Esp8266SocState *s = opaque;
+
+    if (addr < sizeof(s->iomux_regs) && (addr % 4) == 0) {
+        return s->iomux_regs[addr / 4];
+    }
+    return 0;
+}
+
+static void esp8266_iomux_write(void *opaque, hwaddr addr, uint64_t value,
+                                unsigned int size)
+{
+    Esp8266SocState *s = opaque;
+
+    if (addr < sizeof(s->iomux_regs) && (addr % 4) == 0) {
+        s->iomux_regs[addr / 4] = value;
+    }
+}
+
+static const MemoryRegionOps esp8266_iomux_ops = {
+    .read = esp8266_iomux_read,
+    .write = esp8266_iomux_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = {
         .min_access_size = 1,
@@ -225,6 +330,9 @@ static void esp8266_init_rom_stubs(Esp8266SocState *s)
         0x0c, 0x02,             /* movi.n a2, 0 */
         0x0d, 0xf0,             /* ret.n */
     };
+    static const uint8_t cache_read_enable[] = {
+        0xa0, 0x02, 0x00,       /* jx a2 */
+    };
     static const uint8_t ets_putc[] = {
         0x00, 0x00, 0x00, 0x60, /* literal: UART0 FIFO */
         0x31, 0xff, 0xff,       /* l32r a3, . - 4 */
@@ -235,14 +343,18 @@ static void esp8266_init_rom_stubs(Esp8266SocState *s)
     static const uint8_t spi_read[] = {
         0x00, 0x00, 0x20, 0x40, /* literal: mapped flash base */
         0x51, 0xff, 0xff,       /* l32r a5, . - 4 */
-        0x2a, 0x55,             /* add.n a5, a5, a2 */
-        0x8c, 0xd4,             /* beqz.n a4, done */
+        0x57, 0x32, 0x06,       /* bltu a2, a5, add_base */
+        0x5d, 0x02,             /* mov.n a5, a2 */
+        0xc6, 0x00, 0x00,       /* j loop_test */
+        0x00, 0x00,             /* padding */
+        0x2a, 0x55,             /* add_base: add.n a5, a5, a2 */
+        0x8c, 0xd4,             /* loop_test: beqz.n a4, done */
         0x62, 0x05, 0x00,       /* l8ui a6, a5, 0 */
         0x62, 0x43, 0x00,       /* s8i a6, a3, 0 */
         0x1b, 0x55,             /* addi.n a5, a5, 1 */
         0x1b, 0x33,             /* addi.n a3, a3, 1 */
         0x0b, 0x44,             /* addi.n a4, a4, -1 */
-        0x86, 0xfb, 0xff,       /* j loop */
+        0x56, 0x04, 0xff,       /* bnez a4, loop */
         0x0c, 0x02,             /* movi.n a2, 0 */
         0x0d, 0xf0,             /* ret.n */
     };
@@ -259,6 +371,8 @@ static void esp8266_init_rom_stubs(Esp8266SocState *s)
 
     memcpy(rom + ESP8266_ROM_ETS_PRINTF - ESP8266_ROM_BASE, ets_printf,
            sizeof(ets_printf));
+    memcpy(rom + ESP8266_ROM_CACHE_READ_ENABLE - ESP8266_ROM_BASE,
+           cache_read_enable, sizeof(cache_read_enable));
     memcpy(rom + ESP8266_ROM_ETS_PUTC - ESP8266_ROM_BASE - 4, ets_putc,
            sizeof(ets_putc));
     memcpy(rom + ESP8266_ROM_SPI_READ - ESP8266_ROM_BASE - 4, spi_read,
@@ -284,6 +398,10 @@ static void esp8266_soc_realize(DeviceState *dev, Error **errp)
     memory_region_init_ram(&s->dram, OBJECT(dev), "esp8266.dram",
                            ESP8266_DRAM_SIZE, &error_fatal);
     memory_region_add_subregion(system_memory, ESP8266_DRAM_BASE, &s->dram);
+
+    memory_region_init_ram(&s->sram, OBJECT(dev), "esp8266.sram",
+                           ESP8266_SRAM_SIZE, &error_fatal);
+    memory_region_add_subregion(system_memory, ESP8266_SRAM_BASE, &s->sram);
 
     /*
      * IRAM: SDK eboot images commonly place their first segment at
@@ -317,9 +435,21 @@ static void esp8266_soc_realize(DeviceState *dev, Error **errp)
                           "esp8266.uart0", 0x100);
     memory_region_add_subregion(system_memory, 0x60000000, &s->uart0);
 
+    memory_region_init_io(&s->gpio, OBJECT(dev), &esp8266_gpio_ops, s,
+                          "esp8266.gpio", 0x100);
+    memory_region_add_subregion(system_memory, 0x60000300, &s->gpio);
+
     memory_region_init_io(&s->i2c, OBJECT(dev), &esp8266_i2c_ops, s,
                           "esp8266.i2c", 0x400);
     memory_region_add_subregion(system_memory, 0x60000a00, &s->i2c);
+
+    memory_region_init_io(&s->rtc, OBJECT(dev), &esp8266_rtc_ops, s,
+                          "esp8266.rtc", 0x100);
+    memory_region_add_subregion(system_memory, 0x60000700, &s->rtc);
+
+    memory_region_init_io(&s->iomux, OBJECT(dev), &esp8266_iomux_ops, s,
+                          "esp8266.iomux", 0x100);
+    memory_region_add_subregion(system_memory, 0x60001200, &s->iomux);
 
     memory_region_init_io(&s->wifi, OBJECT(dev), &esp8266_wifi_ops, s,
                           "esp8266.wifi", 0x2000);
@@ -327,10 +457,7 @@ static void esp8266_soc_realize(DeviceState *dev, Error **errp)
 
     /* Unimplemented peripherals to avoid crashes */
     create_unimplemented_device("esp8266.spi",   0x60000200, 0x100);
-    create_unimplemented_device("esp8266.gpio",  0x60000300, 0x100);
     create_unimplemented_device("esp8266.timer", 0x60000600, 0x100);
-    create_unimplemented_device("esp8266.rtc",   0x60000700, 0x100);
-    create_unimplemented_device("esp8266.iomux", 0x60001200, 0x100);
 }
 
 static void esp8266_soc_class_init(ObjectClass *oc, void *data)

@@ -7,25 +7,35 @@
 #include "target/xtensa/cpu.h"
 
 #define ESP8266_CPU_COUNT 1
+#define ESP8266_GPIO_MMIO_WORDS (0x100 / 4)
 #define ESP8266_I2C_MMIO_WORDS (0x400 / 4)
+#define ESP8266_RTC_MMIO_WORDS (0x100 / 4)
+#define ESP8266_IOMUX_MMIO_WORDS (0x100 / 4)
 #define ESP8266_WIFI_MMIO_WORDS (0x2000 / 4)
 
 typedef struct Esp8266SocState {
     SysBusDevice parent_obj;
 
     MemoryRegion dram;
+    MemoryRegion sram;
     MemoryRegion dport;
     MemoryRegion iram;
     MemoryRegion rom;
     MemoryRegion irom;
     MemoryRegion drom;
     MemoryRegion uart0;
+    MemoryRegion gpio;
     MemoryRegion i2c;
+    MemoryRegion rtc;
+    MemoryRegion iomux;
     MemoryRegion wifi;
 
     CharBackend uart0_chr;
     XtensaCPU cpu[ESP8266_CPU_COUNT];
+    uint32_t gpio_regs[ESP8266_GPIO_MMIO_WORDS];
     uint32_t i2c_regs[ESP8266_I2C_MMIO_WORDS];
+    uint32_t rtc_regs[ESP8266_RTC_MMIO_WORDS];
+    uint32_t iomux_regs[ESP8266_IOMUX_MMIO_WORDS];
     uint32_t wifi_regs[ESP8266_WIFI_MMIO_WORDS];
     uint32_t boot_entry;
     bool boot_loaded;
