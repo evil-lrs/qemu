@@ -44,6 +44,10 @@
 #define ESP8266_UART_FIFO 0x00
 #define ESP8266_UART_STATUS 0x1c
 #define ESP8266_DPORT_CHIP_ID 0x58
+#define ESP8266_I2C_CLOCK_GATE 0x348
+#define ESP8266_WIFI_BOOT_MAGIC 0x0d74
+#define ESP8266_WIFI_STATUS 0x0800
+#define ESP8266_WIFI_STATUS_READY (10u << 16)
 
 static uint64_t esp8266_dport_read(void *opaque, hwaddr addr,
                                    unsigned int size)
@@ -100,6 +104,84 @@ static void esp8266_uart_write(void *opaque, hwaddr addr, uint64_t value,
 static const MemoryRegionOps esp8266_uart_ops = {
     .read = esp8266_uart_read,
     .write = esp8266_uart_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
+static uint64_t esp8266_i2c_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    Esp8266SocState *s = opaque;
+
+    if (addr == ESP8266_I2C_CLOCK_GATE) {
+        return s->i2c_regs[addr / 4];
+    }
+    if (addr < sizeof(s->i2c_regs) && (addr % 4) == 0) {
+        return s->i2c_regs[addr / 4];
+    }
+    return 0;
+}
+
+static void esp8266_i2c_write(void *opaque, hwaddr addr, uint64_t value,
+                              unsigned int size)
+{
+    Esp8266SocState *s = opaque;
+
+    if (addr == ESP8266_I2C_CLOCK_GATE) {
+        s->i2c_regs[addr / 4] = value;
+        return;
+    }
+    if (addr < sizeof(s->i2c_regs) && (addr % 4) == 0) {
+        s->i2c_regs[addr / 4] = value;
+    }
+}
+
+static const MemoryRegionOps esp8266_i2c_ops = {
+    .read = esp8266_i2c_read,
+    .write = esp8266_i2c_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
+static uint64_t esp8266_wifi_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    Esp8266SocState *s = opaque;
+
+    switch (addr) {
+    case ESP8266_WIFI_STATUS:
+        return s->wifi_regs[addr / 4] | ESP8266_WIFI_STATUS_READY;
+    case ESP8266_WIFI_BOOT_MAGIC:
+        return s->wifi_regs[addr / 4];
+    default:
+        if (addr < sizeof(s->wifi_regs) && (addr % 4) == 0) {
+            return s->wifi_regs[addr / 4];
+        }
+        return 0;
+    }
+}
+
+static void esp8266_wifi_write(void *opaque, hwaddr addr, uint64_t value,
+                               unsigned int size)
+{
+    Esp8266SocState *s = opaque;
+
+    if (addr == ESP8266_WIFI_BOOT_MAGIC) {
+        s->wifi_regs[addr / 4] = value;
+        return;
+    }
+    if (addr < sizeof(s->wifi_regs) && (addr % 4) == 0) {
+        s->wifi_regs[addr / 4] = value;
+    }
+}
+
+static const MemoryRegionOps esp8266_wifi_ops = {
+    .read = esp8266_wifi_read,
+    .write = esp8266_wifi_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = {
         .min_access_size = 1,
@@ -235,14 +317,20 @@ static void esp8266_soc_realize(DeviceState *dev, Error **errp)
                           "esp8266.uart0", 0x100);
     memory_region_add_subregion(system_memory, 0x60000000, &s->uart0);
 
+    memory_region_init_io(&s->i2c, OBJECT(dev), &esp8266_i2c_ops, s,
+                          "esp8266.i2c", 0x400);
+    memory_region_add_subregion(system_memory, 0x60000a00, &s->i2c);
+
+    memory_region_init_io(&s->wifi, OBJECT(dev), &esp8266_wifi_ops, s,
+                          "esp8266.wifi", 0x2000);
+    memory_region_add_subregion(system_memory, 0x60009000, &s->wifi);
+
     /* Unimplemented peripherals to avoid crashes */
     create_unimplemented_device("esp8266.spi",   0x60000200, 0x100);
     create_unimplemented_device("esp8266.gpio",  0x60000300, 0x100);
     create_unimplemented_device("esp8266.timer", 0x60000600, 0x100);
     create_unimplemented_device("esp8266.rtc",   0x60000700, 0x100);
-    create_unimplemented_device("esp8266.i2c",   0x60000a00, 0x400);
     create_unimplemented_device("esp8266.iomux", 0x60001200, 0x100);
-    create_unimplemented_device("esp8266.wifi",  0x60009000, 0x2000);
 }
 
 static void esp8266_soc_class_init(ObjectClass *oc, void *data)

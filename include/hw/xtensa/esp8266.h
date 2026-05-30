@@ -7,6 +7,8 @@
 #include "target/xtensa/cpu.h"
 
 #define ESP8266_CPU_COUNT 1
+#define ESP8266_I2C_MMIO_WORDS (0x400 / 4)
+#define ESP8266_WIFI_MMIO_WORDS (0x2000 / 4)
 
 typedef struct Esp8266SocState {
     SysBusDevice parent_obj;
@@ -18,9 +20,13 @@ typedef struct Esp8266SocState {
     MemoryRegion irom;
     MemoryRegion drom;
     MemoryRegion uart0;
+    MemoryRegion i2c;
+    MemoryRegion wifi;
 
     CharBackend uart0_chr;
     XtensaCPU cpu[ESP8266_CPU_COUNT];
+    uint32_t i2c_regs[ESP8266_I2C_MMIO_WORDS];
+    uint32_t wifi_regs[ESP8266_WIFI_MMIO_WORDS];
     uint32_t boot_entry;
     bool boot_loaded;
 } Esp8266SocState;
