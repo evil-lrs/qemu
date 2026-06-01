@@ -15,6 +15,7 @@
 #include "hw/ssi/sx128x.h"
 #include "hw/qdev-properties.h"
 #include "hw/irq.h"
+#include "qemu/timer.h"
 
 /* Opcodes (table 11-1). Only the ones we treat specially are named; the
  * rest are accepted with a parameter count taken from sx128x_param_count(). */
@@ -36,6 +37,7 @@
 #define SX128X_OP_GET_IRQ_STATUS          0x15
 #define SX128X_OP_CLEAR_IRQ_STATUS        0x97
 #define SX128X_OP_GET_PACKET_STATUS       0x1D
+#define SX128X_OP_GET_RSSI_INST           0x1F
 #define SX128X_OP_GET_PACKET_TYPE         0x03
 #define SX128X_OP_SET_DIO_IRQ_PARAMS      0x8D
 #define SX128X_OP_SET_TX_PARAMS           0x8E
@@ -76,6 +78,7 @@ static const char *sx128x_opcode_name(uint8_t op)
     case SX128X_OP_GET_IRQ_STATUS:          return "GetIrqStatus";
     case SX128X_OP_CLEAR_IRQ_STATUS:        return "ClearIrqStatus";
     case SX128X_OP_GET_PACKET_STATUS:       return "GetPacketStatus";
+    case SX128X_OP_GET_RSSI_INST:           return "GetRssiInst";
     case SX128X_OP_GET_PACKET_TYPE:         return "GetPacketType";
     case SX128X_OP_SET_DIO_IRQ_PARAMS:      return "SetDioIrqParams";
     case SX128X_OP_SET_TX_PARAMS:           return "SetTxParams";
@@ -114,6 +117,7 @@ static uint8_t sx128x_param_count(uint8_t op)
     case SX128X_OP_GET_IRQ_STATUS:          return 3; /* 1 NOP + 2 status bytes */
     case SX128X_OP_GET_RX_BUFFER_STATUS:    return 3; /* 1 NOP + 2 bytes */
     case SX128X_OP_GET_PACKET_TYPE:         return 2; /* 1 NOP + 1 byte */
+    case SX128X_OP_GET_RSSI_INST:           return 1; /* 1 encoded RSSI byte */
     case SX128X_OP_SET_FS:                  return 0;
     case SX128X_OP_GET_PACKET_STATUS:       return 6; /* 1 NOP + 5 bytes */
     case SX128X_OP_SET_RF_FREQUENCY:        return 3; /* SX128x freq is 3 bytes (24-bit) */
@@ -157,6 +161,7 @@ static void sx128x_load_defaults(SX128xState *s)
     s->packet_type = 0;
     s->rf_freq_raw = 0;
     s->tx_payload_len = 0;
+    s->trace_start_ns = 0;
 
     /*
      * RadioLib's findChip() reads the version string and memcmps the
@@ -170,7 +175,155 @@ static void sx128x_load_defaults(SX128xState *s)
     memcpy(&s->regs[0x01F0], version_str, sizeof(version_str));
 
     memset(s->dio_level, 0, sizeof(s->dio_level));
+    timer_del(&s->tx_done_timer);
+    timer_del(&s->rx_done_timer);
     qemu_set_irq(s->busy, 0);
+}
+
+static uint64_t sx128x_freq_hz(SX128xState *s)
+{
+    return ((uint64_t)s->rf_freq_raw * 52000000ULL) >> 18;
+}
+
+static void sx128x_trace_time(SX128xState *s, uint64_t *h, uint64_t *m,
+                              uint64_t *sec)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (s->trace_start_ns == 0) {
+        s->trace_start_ns = now;
+    }
+
+    uint64_t elapsed = (now - s->trace_start_ns) / 1000000000ULL;
+    *h = elapsed / 3600;
+    *m = (elapsed / 60) % 60;
+    *sec = elapsed % 60;
+}
+
+static void sx128x_trace_event(SX128xState *s, const char *fmt, ...)
+{
+    uint64_t h, m, sec;
+    va_list ap;
+    g_autofree char *event = NULL;
+
+    sx128x_trace_time(s, &h, &m, &sec);
+
+    va_start(ap, fmt);
+    event = g_strdup_vprintf(fmt, ap);
+    va_end(ap);
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "SX128X[sx128x-%d]: %02" PRIu64 ":%02" PRIu64
+                  ":%02" PRIu64 " - %s\n",
+                  s->parent_obj.cs_index, h, m, sec, event);
+}
+
+static const char *sx128x_packet_type_name(uint8_t packet_type)
+{
+    switch (packet_type) {
+    case 0x00:
+        return "GFSK";
+    case 0x01:
+        return "LoRa";
+    case 0x02:
+        return "Ranging";
+    case 0x03:
+        return "FLRC";
+    case 0x04:
+        return "BLE";
+    default:
+        return "?";
+    }
+}
+
+static const char *sx128x_mode_name(uint8_t opcode)
+{
+    switch (opcode) {
+    case SX128X_OP_SET_SLEEP:
+        return "sleep";
+    case SX128X_OP_SET_STANDBY:
+        return "standby";
+    case SX128X_OP_SET_FS:
+        return "fs";
+    case SX128X_OP_SET_TX:
+        return "tx";
+    case SX128X_OP_SET_RX:
+        return "rxContinuous";
+    default:
+        return "?";
+    }
+}
+
+static const char *sx128x_lora_bw_name(uint8_t bw)
+{
+    switch (bw) {
+    case 0x34:
+        return "203";
+    case 0x26:
+        return "406";
+    case 0x18:
+        return "812";
+    case 0x0a:
+        return "1625";
+    default:
+        return "?";
+    }
+}
+
+static const char *sx128x_lora_cr_name(uint8_t cr)
+{
+    switch (cr) {
+    case 0x01:
+        return "4/5";
+    case 0x02:
+        return "4/6";
+    case 0x03:
+        return "4/7";
+    case 0x04:
+        return "4/8";
+    case 0x05:
+        return "LI4/5";
+    case 0x06:
+        return "LI4/6";
+    case 0x07:
+        return "LI4/8";
+    default:
+        return "?";
+    }
+}
+
+static const char *sx128x_flrc_bw_name(uint8_t bw)
+{
+    switch (bw) {
+    case 0x45:
+        return "BR1300/BW1200";
+    case 0x69:
+        return "BR1000/BW1200";
+    case 0x86:
+        return "BR650/BW600";
+    case 0xaa:
+        return "BR520/BW600";
+    case 0xc7:
+        return "BR325/BW300";
+    case 0xeb:
+        return "BR260/BW300";
+    default:
+        return "?";
+    }
+}
+
+static const char *sx128x_flrc_cr_name(uint8_t cr)
+{
+    switch (cr) {
+    case 0x00:
+        return "1/2";
+    case 0x02:
+        return "3/4";
+    case 0x04:
+        return "1/1";
+    default:
+        return "?";
+    }
 }
 
 static int sx128x_set_cs(SSIPeripheral *ss, bool select)
@@ -233,6 +386,35 @@ static void sx128x_log_tx_payload(SX128xState *s)
                   "pkt_type=0x%02x payload=[%s]\n",
                   s->spi_id, s->parent_obj.cs_index, len,
                   s->rf_freq_raw, s->packet_type, hex);
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "SX128X_EVENT spi=%d cs=%d event=SetTx freq_hz=%" PRIu64
+                  " freq_raw=0x%06x packet_type=0x%02x len=%u\n",
+                  s->spi_id, s->parent_obj.cs_index, sx128x_freq_hz(s),
+                  s->rf_freq_raw, s->packet_type, len);
+}
+
+static void sx128x_tx_done_cb(void *opaque)
+{
+    SX128xState *s = opaque;
+    s->irq_status |= SX128X_IRQ_TX_DONE;
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "SX128X_EVENT spi=%d cs=%d event=TxDone freq_hz=%" PRIu64
+                  " irq_status=0x%04x\n",
+                  s->spi_id, s->parent_obj.cs_index, sx128x_freq_hz(s),
+                  s->irq_status);
+    sx128x_update_irq(s);
+}
+
+static void sx128x_rx_done_cb(void *opaque)
+{
+    SX128xState *s = opaque;
+    s->irq_status |= SX128X_IRQ_RX_DONE;
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "SX128X_EVENT spi=%d cs=%d event=RxDone freq_hz=%" PRIu64
+                  " irq_status=0x%04x\n",
+                  s->spi_id, s->parent_obj.cs_index, sx128x_freq_hz(s),
+                  s->irq_status);
+    sx128x_update_irq(s);
 }
 
 /*
@@ -254,9 +436,21 @@ static void sx128x_complete_opcode(SX128xState *s)
         s->rf_freq_raw = ((uint32_t)s->param_buf[0] << 16) |
                          ((uint32_t)s->param_buf[1] << 8)  |
                           (uint32_t)s->param_buf[2];
+        sx128x_trace_event(s, "setRf %.3fMHz raw=0x%06x",
+                           (double)sx128x_freq_hz(s) / 1000000.0,
+                           s->rf_freq_raw);
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SX128X_EVENT spi=%d cs=%d event=SetRfFrequency "
+                      "freq_hz=%" PRIu64 " freq_raw=0x%06x raw=[%02x %02x %02x]\n",
+                      s->spi_id, s->parent_obj.cs_index, sx128x_freq_hz(s),
+                      s->rf_freq_raw, s->param_buf[0], s->param_buf[1],
+                      s->param_buf[2]);
         break;
     case SX128X_OP_SET_PACKET_TYPE:
         s->packet_type = s->param_buf[0];
+        sx128x_trace_event(s, "setPacketType %s raw=0x%02x",
+                           sx128x_packet_type_name(s->packet_type),
+                           s->packet_type);
         break;
     case SX128X_OP_SET_PACKET_PARAMS:
         memcpy(s->packet_params, s->param_buf, 7);
@@ -264,31 +458,101 @@ static void sx128x_complete_opcode(SX128xState *s)
          * is encoded differently, but using it as TX length is good enough
          * for the stub.) */
         s->tx_payload_len = s->param_buf[2];
+        sx128x_trace_event(s,
+                           "setPacketParams type=%s preamble=0x%02x "
+                           "header=0x%02x payloadLen=%u crc=0x%02x "
+                           "iq=0x%02x raw=[%02x %02x %02x %02x %02x %02x %02x]",
+                           sx128x_packet_type_name(s->packet_type),
+                           s->param_buf[0], s->param_buf[1],
+                           s->param_buf[2], s->param_buf[3],
+                           s->param_buf[4], s->param_buf[0],
+                           s->param_buf[1], s->param_buf[2],
+                           s->param_buf[3], s->param_buf[4],
+                           s->param_buf[5], s->param_buf[6]);
         break;
     case SX128X_OP_SET_MODULATION_PARAMS:
         memcpy(s->modulation_params, s->param_buf, 3);
+        if (s->packet_type == 0x01 || s->packet_type == 0x02) {
+            sx128x_trace_event(s, "setModulationParams SF%u/BW%s/CR%s raw=[%02x %02x %02x]",
+                               s->param_buf[0] >> 4,
+                               sx128x_lora_bw_name(s->param_buf[1]),
+                               sx128x_lora_cr_name(s->param_buf[2]),
+                               s->param_buf[0], s->param_buf[1],
+                               s->param_buf[2]);
+        } else if (s->packet_type == 0x03) {
+            sx128x_trace_event(s, "setModulationParams FLRC %s/CR%s/BT0x%02x raw=[%02x %02x %02x]",
+                               sx128x_flrc_bw_name(s->param_buf[0]),
+                               sx128x_flrc_cr_name(s->param_buf[1]),
+                               s->param_buf[2], s->param_buf[0],
+                               s->param_buf[1], s->param_buf[2]);
+        } else {
+            sx128x_trace_event(s, "setModulationParams type=%s raw=[%02x %02x %02x]",
+                               sx128x_packet_type_name(s->packet_type),
+                               s->param_buf[0], s->param_buf[1],
+                               s->param_buf[2]);
+        }
         break;
     case SX128X_OP_SET_BUFFER_BASE_ADDRESS:
         s->buf_tx_base = s->param_buf[0];
         s->buf_rx_base = s->param_buf[1];
+        sx128x_trace_event(s, "setBufferBase tx=0x%02x rx=0x%02x",
+                           s->buf_tx_base, s->buf_rx_base);
         break;
     case SX128X_OP_SET_DIO_IRQ_PARAMS:
         s->irq_mask = ((uint16_t)s->param_buf[0] << 8) | s->param_buf[1];
         s->irq_dio1 = ((uint16_t)s->param_buf[2] << 8) | s->param_buf[3];
         s->irq_dio2 = ((uint16_t)s->param_buf[4] << 8) | s->param_buf[5];
         s->irq_dio3 = ((uint16_t)s->param_buf[6] << 8) | s->param_buf[7];
+        sx128x_trace_event(s,
+                           "setDioIrqParams irq=0x%04x dio1=0x%04x "
+                           "dio2=0x%04x dio3=0x%04x",
+                           s->irq_mask, s->irq_dio1, s->irq_dio2,
+                           s->irq_dio3);
         break;
     case SX128X_OP_CLEAR_IRQ_STATUS: {
         uint16_t mask = ((uint16_t)s->param_buf[0] << 8) | s->param_buf[1];
         s->irq_status &= ~mask;
+        sx128x_trace_event(s, "clearIrqStatus mask=0x%04x", mask);
         break;
     }
+    case SX128X_OP_SET_SLEEP:
+    case SX128X_OP_SET_STANDBY:
+    case SX128X_OP_SET_FS:
+        sx128x_trace_event(s, "setMode %s packet=%s raw=[%02x]",
+                           sx128x_mode_name(s->opcode),
+                           sx128x_packet_type_name(s->packet_type),
+                           s->param_pos > 0 ? s->param_buf[0] : 0);
+        break;
+    case SX128X_OP_SET_TX_PARAMS:
+        sx128x_trace_event(s, "setTxParams power=%d ramp=0x%02x",
+                           (int8_t)s->param_buf[0], s->param_buf[1]);
+        break;
+    case SX128X_OP_SET_REGULATOR_MODE:
+        sx128x_trace_event(s, "setRegulatorMode raw=0x%02x",
+                           s->param_buf[0]);
+        break;
     case SX128X_OP_SET_TX:
+        sx128x_trace_event(s, "setMode %s packet=%s timeout=[%02x %02x %02x]",
+                           sx128x_mode_name(s->opcode),
+                           sx128x_packet_type_name(s->packet_type),
+                           s->param_buf[0], s->param_buf[1],
+                           s->param_buf[2]);
         sx128x_log_tx_payload(s);
-        s->irq_status |= SX128X_IRQ_TX_DONE;
+        timer_mod(&s->tx_done_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000 * 1000);
         break;
     case SX128X_OP_SET_RX:
-        /* No RX modeling; just log. */
+        sx128x_trace_event(s, "setMode %s packet=%s timeout=[%02x %02x %02x]",
+                           sx128x_mode_name(s->opcode),
+                           sx128x_packet_type_name(s->packet_type),
+                           s->param_buf[0], s->param_buf[1],
+                           s->param_buf[2]);
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SX128X_EVENT spi=%d cs=%d event=SetRx freq_hz=%" PRIu64
+                      " freq_raw=0x%06x timeout=[%02x %02x %02x]\n",
+                      s->spi_id, s->parent_obj.cs_index, sx128x_freq_hz(s),
+                      s->rf_freq_raw, s->param_buf[0], s->param_buf[1],
+                      s->param_buf[2]);
         break;
     case SX128X_OP_WRITE_REGISTER:
         s->reg_addr = ((uint16_t)s->param_buf[0] << 8) | s->param_buf[1];
@@ -328,7 +592,10 @@ static uint8_t sx128x_param_byte_for_phase(SX128xState *s, uint8_t i)
         if (i == 2) return s->buf_rx_base;
         return 0;
     case SX128X_OP_GET_PACKET_STATUS:
-        return 0; /* RSSI/SNR/errors — all zero for stub */
+        if (i == 1) return 240; /* pkt RSSI: -120 dBm encoded as -rssi*2 */
+        return 0; /* SNR/errors are zero for the stub. */
+    case SX128X_OP_GET_RSSI_INST:
+        return 240; /* instant RSSI: -120 dBm encoded as -rssi*2 */
     case SX128X_OP_GET_PACKET_TYPE:
         if (i == 0) return 0;            /* NOP */
         if (i == 1) return s->packet_type;
@@ -387,6 +654,7 @@ static uint32_t sx128x_transfer(SSIPeripheral *ss, uint32_t tx)
         bool is_getter = (s->opcode == SX128X_OP_GET_IRQ_STATUS ||
                           s->opcode == SX128X_OP_GET_RX_BUFFER_STATUS ||
                           s->opcode == SX128X_OP_GET_PACKET_STATUS ||
+                          s->opcode == SX128X_OP_GET_RSSI_INST ||
                           s->opcode == SX128X_OP_GET_PACKET_TYPE);
         if (is_getter) {
             out = sx128x_param_byte_for_phase(s, s->param_pos);
@@ -500,6 +768,10 @@ static void sx128x_instance_init(Object *obj)
     qdev_init_gpio_out_named(DEVICE(s), s->dio,
                              SX128X_DIO_GPIO, SX128X_DIO_COUNT);
     qdev_init_gpio_out_named(DEVICE(s), &s->busy, SX128X_BUSY_GPIO, 1);
+    timer_init_ns(&s->tx_done_timer, QEMU_CLOCK_VIRTUAL,
+                  sx128x_tx_done_cb, s);
+    timer_init_ns(&s->rx_done_timer, QEMU_CLOCK_VIRTUAL,
+                  sx128x_rx_done_cb, s);
 }
 
 static const TypeInfo sx128x_info = {

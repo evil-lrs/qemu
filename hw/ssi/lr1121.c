@@ -84,6 +84,10 @@
 #define LR1121_OP_LRFHSS_SET_SYNC_WORD    0x022D
 #define LR1121_OP_GET_LORA_RX_HDR_INFOS   0x0230
 
+#define LR1121_OP_SET_FREQ_SET_RX         0x0701
+#define LR1121_OP_WRITE_BUFFER8_SET_TX    0x0704
+#define LR1121_OP_WRITE_BUFFER8_SET_FREQ_SET_TX 0x0705
+
 #define LR1121_OP_SET_GNSS_CONSTELLATION  0x0400
 #define LR1121_OP_SET_GNSS_SCAN_MODE      0x0401
 
@@ -167,6 +171,9 @@ static const char *lr1121_opcode_name(uint16_t op)
     case LR1121_OP_SET_LORA_SYNC_WORD:    return "SetLoRaSyncWord";
     case LR1121_OP_SET_CAD:               return "SetCad";
     case LR1121_OP_SET_CAD_PARAMS:        return "SetCadParams";
+    case LR1121_OP_SET_FREQ_SET_RX:       return "SetFreqSetRx";
+    case LR1121_OP_WRITE_BUFFER8_SET_TX:  return "WriteBuffer8SetTx";
+    case LR1121_OP_WRITE_BUFFER8_SET_FREQ_SET_TX: return "WriteBuffer8SetFreqSetTx";
     default:                              return NULL;
     }
 }
@@ -232,6 +239,7 @@ static uint16_t lr1121_param_count(uint16_t op)
     case LR1121_OP_CLEAR_IRQ:
     case LR1121_OP_SET_TCXO_MODE:
     case LR1121_OP_LRFHSS_SET_SYNC_WORD:
+    case LR1121_OP_SET_PA_CONFIG:
         return 4;
 
     case LR1121_OP_READ_REG_MEM32:
@@ -240,6 +248,7 @@ static uint16_t lr1121_param_count(uint16_t op)
     case LR1121_OP_AUTO_TX_RX:
     case LR1121_OP_SET_CAD_PARAMS:
     case LR1121_OP_SET_RX_DUTY_CYCLE:
+    case LR1121_OP_SET_FREQ_SET_RX:
         return 7;
 
     case LR1121_OP_SET_DIO_IRQ_PARAMS:
@@ -267,6 +276,8 @@ static uint16_t lr1121_param_count(uint16_t op)
 
     case LR1121_OP_WRITE_BUFFER8:
     case LR1121_OP_LRFHSS_BUILD_FRAME:
+    case LR1121_OP_WRITE_BUFFER8_SET_TX:
+    case LR1121_OP_WRITE_BUFFER8_SET_FREQ_SET_TX:
         return 0; /* data until CS deassert */
 
 
@@ -400,9 +411,12 @@ static int lr1121_set_cs(SSIPeripheral *ss, bool select)
 
     if (!is_selected && s->selected) {
         if ((s->opcode == LR1121_OP_WRITE_BUFFER8 ||
-             s->opcode == LR1121_OP_LRFHSS_BUILD_FRAME) &&
+             s->opcode == LR1121_OP_LRFHSS_BUILD_FRAME ||
+             s->opcode == LR1121_OP_WRITE_BUFFER8_SET_TX ||
+             s->opcode == LR1121_OP_WRITE_BUFFER8_SET_FREQ_SET_TX) &&
             s->phase == LR1121_STATE_BUF_DATA) {
             s->tx_payload_len = s->buf_addr;
+            lr1121_complete_opcode(s);
         } else if (s->phase == LR1121_STATE_PARAMS || s->phase == LR1121_STATE_OPCODE_LSB) {
             lr1121_complete_opcode(s);
         }
@@ -507,15 +521,34 @@ static void lr1121_log_tx_payload(LR1121State *s)
     }
 
     qemu_log_mask(LOG_GUEST_ERROR,
-                  "LR1121[SPI%d:CS%d]: TX len=%u freq_hz=%u "
+                  "LR1121[SPI%d:CS%d]: t=%.6f TX len=%u freq_hz=%u "
                   "pkt_type=0x%02x\n",
                   s->spi_id,
                   s->parent_obj.cs_index,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000000000.0,
                   s->tx_payload_len,
                   s->rf_freq_hz,
                   s->packet_type);
     
     g_string_free(js, true);
+}
+
+static void lr1121_tx_done_cb(void *opaque)
+{
+    LR1121State *s = opaque;
+
+    if (s->irq_status & LR1121_IRQ_TX_DONE) {
+        s->irq_status &= ~LR1121_IRQ_TX_DONE;
+        lr1121_update_irq(s);
+    }
+    s->irq_status |= LR1121_IRQ_TX_DONE;
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "LR1121_EVENT t=%.6f spi=%u cs=%u event=TxDone freq_hz=%u "
+                  "irq_status=0x%08x\n",
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000000000.0,
+                  s->spi_id, s->parent_obj.cs_index, s->rf_freq_hz,
+                  s->irq_status);
+    lr1121_update_irq(s);
 }
 
 static const char *lr1121_packet_type_name(uint8_t type)
@@ -579,8 +612,9 @@ static void lr1121_log_config_event(LR1121State *s, const char *event)
     lr1121_format_bytes(raw, sizeof(raw), s->param_buf, s->param_pos);
 
     qemu_log_mask(LOG_GUEST_ERROR,
-                  "LR1121_EVENT spi=%u cs=%u event=%s opcode=0x%04x "
+                  "LR1121_EVENT t=%.6f spi=%u cs=%u event=%s opcode=0x%04x "
                   "freq_hz=%u packet_type=0x%02x(%s) raw=[%s]\n",
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000000000.0,
                   s->spi_id, s->parent_obj.cs_index, event, s->opcode,
                   s->rf_freq_hz, s->packet_type,
                   lr1121_packet_type_name(s->packet_type), raw);
@@ -593,9 +627,10 @@ static void lr1121_log_lora_mod_params(LR1121State *s)
 
     if (s->param_pos >= 4) {
         qemu_log_mask(LOG_GUEST_ERROR,
-                      "LR1121_EVENT spi=%u cs=%u event=SetModulationParams "
+                      "LR1121_EVENT t=%.6f spi=%u cs=%u event=SetModulationParams "
                       "packet=LoRa sf=SF%u bw=0x%02x(%s) cr=0x%02x(%s) "
                       "ldro=0x%02x raw=[%s]\n",
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000000000.0,
                       s->spi_id, s->parent_obj.cs_index,
                       s->param_buf[0],
                       s->param_buf[1], lr1121_lora_bw_name(s->param_buf[1]),
@@ -614,9 +649,10 @@ static void lr1121_log_lora_packet_params(LR1121State *s)
     if (s->param_pos >= 6) {
         uint16_t preamble = ((uint16_t)s->param_buf[0] << 8) | s->param_buf[1];
         qemu_log_mask(LOG_GUEST_ERROR,
-                      "LR1121_EVENT spi=%u cs=%u event=SetPacketParams "
+                      "LR1121_EVENT t=%.6f spi=%u cs=%u event=SetPacketParams "
                       "packet=LoRa preamble=%u header=0x%02x payload_len=%u "
                       "crc=0x%02x invert_iq=0x%02x raw=[%s]\n",
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000000000.0,
                       s->spi_id, s->parent_obj.cs_index, preamble,
                       s->param_buf[2], s->param_buf[3],
                       s->param_buf[4], s->param_buf[5], raw);
@@ -807,15 +843,47 @@ static void lr1121_complete_opcode(LR1121State *s)
 
     case LR1121_OP_SET_TX:
         lr1121_log_tx_payload(s);
-        s->irq_status |= LR1121_IRQ_TX_DONE;
         s->status2 = (s->status2 & 0xF1) | (LR1121_STAT2_MODE_TX << 1);
         lr1121_send_state(s);
         lr1121_log_config_event(s, "SetTx");
+        timer_mod(&s->tx_done_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000 * 1000);
+        break;
+
+    case LR1121_OP_WRITE_BUFFER8_SET_TX:
+    case LR1121_OP_WRITE_BUFFER8_SET_FREQ_SET_TX:
+        if (s->opcode == LR1121_OP_WRITE_BUFFER8_SET_FREQ_SET_TX &&
+            s->param_pos >= 4) {
+            s->rf_freq_hz =
+                ((uint32_t)s->param_buf[0] << 24) |
+                ((uint32_t)s->param_buf[1] << 16) |
+                ((uint32_t)s->param_buf[2] << 8)  |
+                ((uint32_t)s->param_buf[3]);
+            lr1121_log_config_event(s, "SetRfFrequency");
+        }
+        lr1121_log_tx_payload(s);
+        s->status2 = (s->status2 & 0xF1) | (LR1121_STAT2_MODE_TX << 1);
+        lr1121_send_state(s);
+        lr1121_log_config_event(s, "SetTx");
+        timer_mod(&s->tx_done_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000 * 1000);
         break;
 
     case LR1121_OP_SET_RX:
         s->status2 = (s->status2 & 0xF1) | (LR1121_STAT2_MODE_RX << 1);
         lr1121_send_state(s);
+        lr1121_log_config_event(s, "SetRx");
+        break;
+
+    case LR1121_OP_SET_FREQ_SET_RX:
+        s->rf_freq_hz =
+            ((uint32_t)s->param_buf[0] << 24) |
+            ((uint32_t)s->param_buf[1] << 16) |
+            ((uint32_t)s->param_buf[2] << 8)  |
+            ((uint32_t)s->param_buf[3]);
+        s->status2 = (s->status2 & 0xF1) | (LR1121_STAT2_MODE_RX << 1);
+        lr1121_send_state(s);
+        lr1121_log_config_event(s, "SetRfFrequency");
         lr1121_log_config_event(s, "SetRx");
         break;
 
@@ -900,9 +968,9 @@ static uint8_t lr1121_response_byte(LR1121State *s)
     case LR1121_OP_GET_VERSION:
         if (i == 0) res = s->status1;
         else if (i == 1) res = 0x01; /* hw */
-        else if (i == 2) res = 0x03; /* type: LR1121 */
+        else if (i == 2) res = 0xf3; /* transceiver firmware type */
         else if (i == 3) res = 0x01; /* fw major */
-        else if (i == 4) res = 0x01; /* fw minor */
+        else if (i == 4) res = 0x04; /* fw minor */
         break;
 
     case LR1121_OP_GET_ERRORS:
@@ -1062,7 +1130,9 @@ static uint32_t lr1121_transfer(SSIPeripheral *ss, uint32_t tx)
                       s->param_needed);
 
         if (s->opcode == LR1121_OP_WRITE_BUFFER8 ||
-            s->opcode == LR1121_OP_LRFHSS_BUILD_FRAME) {
+            s->opcode == LR1121_OP_LRFHSS_BUILD_FRAME ||
+            s->opcode == LR1121_OP_WRITE_BUFFER8_SET_TX ||
+            s->opcode == LR1121_OP_WRITE_BUFFER8_SET_FREQ_SET_TX) {
             s->buf_addr = 0;
             s->tx_payload_len = 0;
             s->phase = LR1121_STATE_BUF_DATA;
@@ -1156,6 +1226,7 @@ static void lr1121_realize(SSIPeripheral *ss, Error **errp)
 static void lr1121_reset(DeviceState *dev)
 {
     LR1121State *s = LR1121(dev);
+    timer_del(&s->tx_done_timer);
     lr1121_load_defaults(s);
 }
 
@@ -1188,6 +1259,8 @@ static void lr1121_instance_init(Object *obj)
     qdev_init_gpio_out_named(DEVICE(s), s->dio,
                              LR1121_DIO_GPIO, LR1121_DIO_COUNT);
     qdev_init_gpio_out_named(DEVICE(s), &s->busy, LR1121_BUSY_GPIO, 1);
+    timer_init_ns(&s->tx_done_timer, QEMU_CLOCK_VIRTUAL,
+                  lr1121_tx_done_cb, s);
 }
 
 static const TypeInfo lr1121_info = {

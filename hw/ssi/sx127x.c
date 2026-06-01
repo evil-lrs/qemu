@@ -16,6 +16,12 @@
 
 #define SX127X_REG_FIFO        0x00
 #define SX127X_REG_OP_MODE     0x01
+#define SX127X_REG_FRF_MSB     0x06
+#define SX127X_REG_FRF_MID     0x07
+#define SX127X_REG_FRF_LSB     0x08
+#define SX127X_REG_PA_CONFIG   0x09
+#define SX127X_REG_OCP         0x0b
+#define SX127X_REG_LNA         0x0c
 #define SX127X_REG_FIFO_ADDR_PTR 0x0d
 #define SX127X_REG_FIFO_TX_BASE_ADDR 0x0e
 #define SX127X_REG_FIFO_RX_BASE_ADDR 0x0f
@@ -29,6 +35,8 @@
 #define SX127X_REG_PREAMBLE_LSB 0x21
 #define SX127X_REG_PAYLOAD_LENGTH 0x22
 #define SX127X_REG_MODEM_CONFIG3 0x26
+#define SX127X_REG_DETECT_OPTIMIZE 0x31
+#define SX127X_REG_DETECTION_THRESHOLD 0x37
 #define SX127X_REG_SYNC_WORD  0x39
 #define SX127X_REG_DIO_MAPPING1 0x40
 #define SX127X_REG_VERSION     0x42
@@ -38,6 +46,8 @@
 #define SX127X_IRQ_TX_DONE     0x08
 #define SX127X_HOP_CHANNEL_CRC_ON_PAYLOAD 0x40
 #define SX127X_MODEM_CONFIG2_RX_PAYLOAD_CRC_ON 0x04
+#define SX127X_TRACE_RAW_SPI   0
+#define SX127X_TX_DONE_DELAY_NS 200000
 
 static const char *sx127x_reg_name(uint8_t addr)
 {
@@ -46,6 +56,12 @@ static const char *sx127x_reg_name(uint8_t addr)
         return "RegFifo";
     case SX127X_REG_OP_MODE:
         return "RegOpMode";
+    case SX127X_REG_PA_CONFIG:
+        return "RegPaConfig";
+    case SX127X_REG_OCP:
+        return "RegOcp";
+    case SX127X_REG_LNA:
+        return "RegLna";
     case SX127X_REG_FIFO_ADDR_PTR:
         return "RegFifoAddrPtr";
     case SX127X_REG_FIFO_TX_BASE_ADDR:
@@ -165,8 +181,9 @@ static void sx127x_trace_frequency(SX127xState *s)
     }
 
     s->trace_frf = frf;
-    sx127x_trace_event(s, "setRf %.3fMHz",
-                       (double)frf * 32000000.0 / 524288.0 / 1000000.0);
+    sx127x_trace_event(s, "setRf %.3fMHz raw=0x%06x",
+                       (double)frf * 32000000.0 / 524288.0 / 1000000.0,
+                       frf);
 }
 
 static void sx127x_trace_modulation(SX127xState *s)
@@ -231,10 +248,79 @@ static void sx127x_trace_op_mode(SX127xState *s)
                        op_mode);
 }
 
+static uint8_t sx127x_effective_op_mode(SX127xState *s, uint8_t value)
+{
+    uint8_t old = s->regs[SX127X_REG_OP_MODE];
+
+    /*
+     * LongRangeMode is latched while the chip is in sleep. Some drivers later
+     * write only the low operating-mode bits, so preserve the packet-type bit
+     * for non-sleep target modes.
+     */
+    if ((value & 0x07) != 0 && (value & 0x80) != (old & 0x80)) {
+        value = (value & 0x7f) | (old & 0x80);
+    }
+
+    return value;
+}
+
+static void sx127x_trace_radio_config(SX127xState *s, uint8_t addr)
+{
+    switch (addr) {
+    case SX127X_REG_PA_CONFIG:
+        if (s->regs[addr] != s->trace_pa_config) {
+            s->trace_pa_config = s->regs[addr];
+            sx127x_trace_event(s, "setOutputPower pa=%s raw=0x%02x",
+                               (s->regs[addr] & 0x80) ? "PA_BOOST" : "RFO",
+                               s->regs[addr]);
+        }
+        break;
+    case SX127X_REG_OCP:
+        if (s->regs[addr] != s->trace_ocp) {
+            s->trace_ocp = s->regs[addr];
+            sx127x_trace_event(s, "setOcp raw=0x%02x",
+                               s->regs[addr]);
+        }
+        break;
+    case SX127X_REG_LNA:
+        if (s->regs[addr] != s->trace_lna) {
+            s->trace_lna = s->regs[addr];
+            sx127x_trace_event(s, "setLna raw=0x%02x",
+                               s->regs[addr]);
+        }
+        break;
+    case SX127X_REG_DIO_MAPPING1:
+        if (s->regs[addr] != s->trace_dio_mapping1) {
+            s->trace_dio_mapping1 = s->regs[addr];
+            sx127x_trace_event(s, "setDioMapping1 raw=0x%02x",
+                               s->regs[addr]);
+        }
+        break;
+    case SX127X_REG_DETECT_OPTIMIZE:
+        if (s->regs[addr] != s->trace_detect_optimize) {
+            s->trace_detect_optimize = s->regs[addr];
+            sx127x_trace_event(s, "setDetectOptimize raw=0x%02x",
+                               s->regs[addr]);
+        }
+        break;
+    case SX127X_REG_DETECTION_THRESHOLD:
+        if (s->regs[addr] != s->trace_detection_threshold) {
+            s->trace_detection_threshold = s->regs[addr];
+            sx127x_trace_event(s, "setDetectionThreshold raw=0x%02x",
+                               s->regs[addr]);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
 static void sx127x_trace_config_write(SX127xState *s, uint8_t addr)
 {
     switch (addr) {
-    case 0x08:
+    case SX127X_REG_FRF_MSB:
+    case SX127X_REG_FRF_MID:
+    case SX127X_REG_FRF_LSB:
         sx127x_trace_frequency(s);
         break;
     case SX127X_REG_MODEM_CONFIG1:
@@ -252,6 +338,7 @@ static void sx127x_trace_config_write(SX127xState *s, uint8_t addr)
         sx127x_trace_op_mode(s);
         break;
     default:
+        sx127x_trace_radio_config(s, addr);
         break;
     }
 }
@@ -298,6 +385,12 @@ static void sx127x_load_defaults(SX127xState *s)
     s->trace_payload_length = UINT8_MAX;
     s->trace_preamble_length = UINT16_MAX;
     s->trace_sync_word = UINT8_MAX;
+    s->trace_pa_config = UINT8_MAX;
+    s->trace_ocp = UINT8_MAX;
+    s->trace_lna = UINT8_MAX;
+    s->trace_dio_mapping1 = UINT8_MAX;
+    s->trace_detect_optimize = UINT8_MAX;
+    s->trace_detection_threshold = UINT8_MAX;
     memset(s->dio_level, 0, sizeof(s->dio_level));
 }
 
@@ -306,8 +399,12 @@ static int sx127x_set_cs(SSIPeripheral *ss, bool select)
     SX127xState *s = SX127X(ss);
     bool is_selected = (select == (ss->spc->cs_polarity == SSI_CS_HIGH));
 
-    qemu_log_mask(LOG_GUEST_ERROR, "SX127X[SPI%d:CS%d]: set_cs level=%d (selected=%d, have_addr=%d)\n",
-                  s->spi_id, s->parent_obj.cs_index, select, is_selected, s->have_addr);
+    if (SX127X_TRACE_RAW_SPI) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SX127X[SPI%d:CS%d]: set_cs level=%d (selected=%d, have_addr=%d)\n",
+                      s->spi_id, s->parent_obj.cs_index, select, is_selected,
+                      s->have_addr);
+    }
 
     if (is_selected && !s->selected && (!s->have_addr || s->data_count != 0)) {
         s->have_addr = false;
@@ -327,13 +424,23 @@ static void sx127x_update_irq(SX127xState *s)
     bool irq = s->regs[SX127X_REG_IRQ_FLAGS] != 0;
 
     if (s->dio_level[0] != irq) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "SX127X[SPI%d:CS%d]: DIO0 %s irq=0x%02x\n",
-                      s->spi_id, s->parent_obj.cs_index,
-                      irq ? "high" : "low", s->regs[SX127X_REG_IRQ_FLAGS]);
+        if (SX127X_TRACE_RAW_SPI) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "SX127X[SPI%d:CS%d]: DIO0 %s irq=0x%02x\n",
+                          s->spi_id, s->parent_obj.cs_index,
+                          irq ? "high" : "low", s->regs[SX127X_REG_IRQ_FLAGS]);
+        }
         s->dio_level[0] = irq;
     }
     qemu_set_irq(s->dio[0], irq);
+}
+
+static void sx127x_tx_done_cb(void *opaque)
+{
+    SX127xState *s = SX127X(opaque);
+
+    s->regs[SX127X_REG_IRQ_FLAGS] |= SX127X_IRQ_TX_DONE;
+    sx127x_update_irq(s);
 }
 
 static void sx127x_rx_cb(void *opaque, const SemtechRadioFrame *f)
@@ -461,6 +568,9 @@ static uint8_t sx127x_read_reg(SX127xState *s, uint8_t addr)
 
     uint8_t radio_id = s->parent_obj.cs_index;
 
+    if (!SX127X_TRACE_RAW_SPI) {
+        return value;
+    }
     if (sx127x_reg_name(addr)) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "SX127X[SPI%d:CS%d]: %s read -> 0x%02x\n",
@@ -483,11 +593,15 @@ static void sx127x_write_reg(SX127xState *s, uint8_t addr, uint8_t value)
     } else if (addr == SX127X_REG_IRQ_FLAGS) {
         s->regs[SX127X_REG_IRQ_FLAGS] &= ~value;
     } else if (addr == SX127X_REG_OP_MODE) {
+        value = sx127x_effective_op_mode(s, value);
         s->regs[addr & 0x7f] = value;
         if ((value & 0x07) == 0x03) { /* TX mode */
+            s->regs[SX127X_REG_IRQ_FLAGS] &= ~SX127X_IRQ_TX_DONE;
+            sx127x_update_irq(s);
             sx127x_send_tx(s);
-            /* Immediately trigger TX_DONE in RegIrqFlags */
-            s->regs[SX127X_REG_IRQ_FLAGS] |= SX127X_IRQ_TX_DONE;
+            timer_mod(&s->tx_done_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      SX127X_TX_DONE_DELAY_NS);
         }
         if (value != old_mode) {
             sx127x_send_state(s);
@@ -511,6 +625,9 @@ static void sx127x_write_reg(SX127xState *s, uint8_t addr, uint8_t value)
 
     uint8_t radio_id = s->parent_obj.cs_index;
 
+    if (!SX127X_TRACE_RAW_SPI) {
+        return;
+    }
     if (sx127x_reg_name(addr)) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "SX127X[SPI%d:CS%d]: %s write 0x%02x\n",
@@ -533,17 +650,24 @@ static uint32_t sx127x_transfer(SSIPeripheral *ss, uint32_t tx)
         return 0;
     }
 
-    qemu_log_mask(LOG_GUEST_ERROR, "SX127X[SPI%d:CS%d]: transfer byte=0x%02x (have_addr=%d, addr=0x%02x, is_write=%d)\n",
-                  s->spi_id, radio_id, byte, s->have_addr, s->addr, s->is_write);
+    if (SX127X_TRACE_RAW_SPI) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SX127X[SPI%d:CS%d]: transfer byte=0x%02x (have_addr=%d, addr=0x%02x, is_write=%d)\n",
+                      s->spi_id, radio_id, byte, s->have_addr, s->addr,
+                      s->is_write);
+    }
 
     if (!s->have_addr) {
         s->is_write = (byte & 0x80) != 0;
         s->addr = byte & 0x7f;
         s->have_addr = true;
         s->data_count = 0;
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "SX127X[SPI%d:CS%d]: command addr=0x%02x %s\n",
-                      s->spi_id, radio_id, s->addr, s->is_write ? "write" : "read");
+        if (SX127X_TRACE_RAW_SPI) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "SX127X[SPI%d:CS%d]: command addr=0x%02x %s\n",
+                          s->spi_id, radio_id, s->addr,
+                          s->is_write ? "write" : "read");
+        }
         return 0;
     }
 
@@ -584,6 +708,7 @@ static void sx127x_reset(DeviceState *dev)
 {
     SX127xState *s = SX127X(dev);
 
+    timer_del(&s->tx_done_timer);
     sx127x_load_defaults(s);
 }
 
@@ -612,6 +737,8 @@ static void sx127x_instance_init(Object *obj)
 {
     SX127xState *s = SX127X(obj);
 
+    timer_init_ns(&s->tx_done_timer, QEMU_CLOCK_VIRTUAL,
+                  sx127x_tx_done_cb, s);
     qdev_init_gpio_out_named(DEVICE(s), s->dio, SX127X_DIO_GPIO, 6);
 }
 

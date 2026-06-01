@@ -45,7 +45,7 @@ static void esp32_spi_do_command(Esp32SpiState* state, uint32_t cmd_reg);
 
 static bool esp32_spi_debug(Esp32SpiState *s)
 {
-    return s->id >= 2;
+    return s->id >= 2 && getenv("QEMU_ESP32_SPI_TRACE") != NULL;
 }
 
 static const char *esp32_spi_reg_name(hwaddr addr)
@@ -116,7 +116,7 @@ static uint64_t esp32_spi_read(void *opaque, hwaddr addr, unsigned int size)
     switch (addr) {
     case A_SPI_CMD:
         r = s->cmd_reg;
-        if (s->id == 2 || s->id == 3) {
+        if (esp32_spi_debug(s)) {
             fprintf(stderr, "ESP32_SPI%d: read CMD -> 0x%08x\n", s->id, (uint32_t)r);
         }
         break;

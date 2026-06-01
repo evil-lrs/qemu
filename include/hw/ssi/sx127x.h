@@ -2,6 +2,7 @@
 
 #include "hw/ssi/ssi.h"
 #include "hw/ssi/semtech_radio_common.h"
+#include "qemu/timer.h"
 
 #define TYPE_SX127X "sx127x"
 #define SX127X_DIO_GPIO "dio"
@@ -33,6 +34,13 @@ typedef struct SX127xState {
     uint8_t trace_payload_length;
     uint16_t trace_preamble_length;
     uint8_t trace_sync_word;
+    uint8_t trace_pa_config;
+    uint8_t trace_ocp;
+    uint8_t trace_lna;
+    uint8_t trace_dio_mapping1;
+    uint8_t trace_detect_optimize;
+    uint8_t trace_detection_threshold;
+    QEMUTimer tx_done_timer;
 
     qemu_irq dio[6];
 

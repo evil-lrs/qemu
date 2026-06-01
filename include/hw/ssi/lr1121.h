@@ -4,6 +4,7 @@
 #include "hw/ssi/ssi.h"
 #include "hw/irq.h"
 #include "hw/ssi/semtech_radio_common.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 
 #define TYPE_LR1121 "lr1121"
@@ -74,6 +75,7 @@ typedef struct LR1121State {
     uint8_t tx_payload_len;
     uint8_t rx_payload_len;
     uint8_t rx_start_offset;
+    QEMUTimer tx_done_timer;
 
     uint8_t lora_syncword;
     uint64_t gfsk_syncword;

@@ -2,6 +2,7 @@
 #define HW_SSI_SX128X_H
 
 #include "hw/ssi/ssi.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 
 #define TYPE_SX128X "sx128x"
@@ -74,6 +75,9 @@ typedef struct SX128xState {
     uint8_t packet_params[7];
     uint8_t modulation_params[3];
     uint8_t tx_payload_len;     /* extracted from SetPacketParams[2] */
+    int64_t trace_start_ns;
+    QEMUTimer tx_done_timer;
+    QEMUTimer rx_done_timer;
 
     /* Wiring */
     uint8_t spi_id;
