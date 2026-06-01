@@ -3,6 +3,7 @@
 #include "hw/sysbus.h"
 #include "hw/hw.h"
 #include "hw/registerfields.h"
+#include "qemu/timer.h"
 
 #define TYPE_ESP32_GPIO "esp32.gpio"
 #define ESP32_GPIO(obj)             OBJECT_CHECK(Esp32GpioState, (obj), TYPE_ESP32_GPIO)
@@ -31,8 +32,11 @@ typedef struct Esp32GpioState {
     uint32_t enable1;
     uint32_t in_level;
     uint32_t in_level1;
+    uint32_t status;
+    uint32_t status1;
     uint32_t input_log_count;
     uint32_t input_set_log_count;
+    QEMUTimer edge_irq_lower_timer;
 } Esp32GpioState;
 
 typedef struct Esp32GpioClass {

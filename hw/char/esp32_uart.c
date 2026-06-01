@@ -91,6 +91,12 @@ static uint64_t uart_read(void *opaque, hwaddr addr, unsigned int size)
             error_report("esp_uart: read UART FIFO while it is empty");
         } else {
             r = fifo8_pop(&s->rx_fifo);
+            if (getenv("QEMU_ESP32_ELRS_TRACE")) {
+                qemu_log("esp32_uart[%s]: read FIFO value=0x%02x used=%u\n",
+                         object_get_canonical_path_component(OBJECT(s)),
+                         (unsigned)r,
+                         fifo8_num_used(&s->rx_fifo));
+            }
             esp32_uart_update_irq(s);
             qemu_chr_fe_accept_input(&s->chr);
         }
@@ -104,6 +110,15 @@ static uint64_t uart_read(void *opaque, hwaddr addr, unsigned int size)
         r = FIELD_DP32(r, UART_STATUS, RXFIFO_CNT, fifo8_num_used(&s->rx_fifo));
         r = FIELD_DP32(r, UART_STATUS, TXFIFO_CNT, fifo8_num_used(&s->tx_fifo));
         r = FIELD_DP32(r, UART_STATUS, ST_UTX_OUT, tx_state);
+        if (getenv("QEMU_ESP32_ELRS_TRACE")) {
+            qemu_log("esp32_uart[%s]: read STATUS=0x%08x rx=%u tx=%u int_ena=0x%08x int_st=0x%08x\n",
+                     object_get_canonical_path_component(OBJECT(s)),
+                     (unsigned)r,
+                     fifo8_num_used(&s->rx_fifo),
+                     fifo8_num_used(&s->tx_fifo),
+                     s->reg[R_UART_INT_ENA],
+                     s->reg[R_UART_INT_ST]);
+        }
         break;
     }
 
@@ -170,6 +185,14 @@ static void uart_write(void *opaque, hwaddr addr,
 
     case A_UART_INT_ENA:
         s->reg[addr / 4] = value;
+        if (getenv("QEMU_ESP32_ELRS_TRACE")) {
+            qemu_log("esp32_uart[%s]: write INT_ENA=0x%08x raw=0x%08x st=0x%08x rx=%u\n",
+                     object_get_canonical_path_component(OBJECT(s)),
+                     (unsigned)value,
+                     s->reg[R_UART_INT_RAW],
+                     s->reg[R_UART_INT_ST],
+                     fifo8_num_used(&s->rx_fifo));
+        }
         break;
 
     case A_UART_CONF0:
@@ -228,6 +251,16 @@ static void uart_write(void *opaque, hwaddr addr,
          */
         s->rx_tout_thres = 8 * FIELD_EX32(s->reg[R_UART_CONF1], UART_CONF1, TOUT_THRD);
         s->rx_tout_ena = FIELD_EX32(s->reg[R_UART_CONF1], UART_CONF1, TOUT_EN) != 0;
+        if (getenv("QEMU_ESP32_ELRS_TRACE")) {
+            qemu_log("esp32_uart[%s]: write CONF1=0x%08x rx_thr=%u tx_thr=%u tout_ena=%d tout_bits=%u rx=%u\n",
+                     object_get_canonical_path_component(OBJECT(s)),
+                     (unsigned)value,
+                     s->rx_full_threshold,
+                     s->tx_empty_threshold,
+                     s->rx_tout_ena,
+                     s->rx_tout_thres,
+                     fifo8_num_used(&s->rx_fifo));
+        }
         esp32_uart_set_rx_timeout(s);
         esp32_uart_update_irq(s);
         break;
@@ -280,6 +313,15 @@ static void uart_receive(void *opaque, const uint8_t *buf, int size)
 
     if (size == 0) {
         return;
+    }
+
+    if (getenv("QEMU_ESP32_ELRS_TRACE")) {
+        const char *name = object_get_canonical_path_component(OBJECT(s));
+        qemu_log("esp32_uart[%s]: receive size=%d first=0x%02x free=%u\n",
+                 name ? name : "?",
+                 size,
+                 buf[0],
+                 fifo8_num_free(&s->rx_fifo));
     }
 
     /* If we can receive anything: cancel any pending RX timeout timer,

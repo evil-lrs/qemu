@@ -41,6 +41,7 @@
 #include "sysemu/blockdev.h"
 #include "sysemu/block-backend.h"
 #include "exec/exec-all.h"
+#include "exec/tb-flush.h"
 #include "net/net.h"
 #include "elf.h"
 
@@ -106,6 +107,9 @@ static void esp32_dig_reset(void *opaque, int n, int level)
 {
     Esp32SocState *s = ESP32_SOC(opaque);
     if (level) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32: digital reset requested line=%d pc=0x%08" PRIx64 "\n",
+                      n, current_cpu ? current_cpu->mem_io_pc : 0);
         esp32_dport_clear_ill_trap_state(&s->dport);
         s->requested_reset = ESP32_SOC_RESET_DIG;
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
@@ -116,6 +120,9 @@ static void esp32_cpu_reset(void* opaque, int n, int level)
 {
     Esp32SocState *s = ESP32_SOC(opaque);
     if (level) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32: CPU%d reset requested pc=0x%08" PRIx64 "\n",
+                      n, current_cpu ? current_cpu->mem_io_pc : 0);
         s->requested_reset = (n == 0) ? ESP32_SOC_RESET_PROCPU : ESP32_SOC_RESET_APPCPU;
         /* Use different cause for APP CPU so that its reset doesn't cause QEMU to exit,
          * when -no-reboot option is given.
@@ -207,6 +214,12 @@ static void esp32_soc_reset(DeviceState *dev)
         xtensa_select_static_vectors(&s->cpu[1].env, s->rtc_cntl.stat_vector_sel[1]);
         remove_cpu_watchpoints(&s->cpu[1]);
         cpu_reset(CPU(&s->cpu[1]));
+        if (s->dport.appcpu_boot_addr) {
+            s->cpu[1].env.pc = s->dport.appcpu_boot_addr;
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP32: APP CPU boot pc=0x%08x\n",
+                          s->dport.appcpu_boot_addr);
+        }
     }
     s->requested_reset = 0;
 }
@@ -360,7 +373,8 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     }
     qdev_realize(DEVICE(&s->intmatrix), &s->periph_bus, &error_fatal);
     DeviceState* intmatrix_dev = DEVICE(&s->intmatrix);
-    memory_region_add_subregion_overlap(dport_mem, ESP32_DPORT_PRO_INTMATRIX_BASE, sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->intmatrix), 0), -1);
+    memory_region_add_subregion_overlap(dport_mem, ESP32_DPORT_PRO_INTMATRIX_BASE,
+                                        sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->intmatrix), 0), -1);
 
     bool init_cache_err = false;
     if (s->dport.flash_blk) {
@@ -426,6 +440,8 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
 
     qdev_realize(DEVICE(&s->gpio), &s->periph_bus, &error_fatal);
     esp32_soc_add_periph_device(sys_mem, &s->gpio, DR_REG_GPIO_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio), 0,
+                       qdev_get_gpio_in(intmatrix_dev, ETS_GPIO_INTR_SOURCE));
 
     for (int i = 0; i < ESP32_UART_COUNT; ++i) {
         const hwaddr uart_base[] = {DR_REG_UART_BASE, DR_REG_UART1_BASE, DR_REG_UART2_BASE};
@@ -600,7 +616,7 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
 #define ESP32_I2S_STUB(name_, base_, source_) \
     esp32_wifi_stub_add_i2s_region((name_), (base_), \
                                    (base_) - DR_REG_DPORT_APB_BASE + APB_REG_BASE, \
-                                   0x1000, 0xffffffff, \
+                                   0x1000, 0x00000000, \
                                    qdev_get_gpio_in(intmatrix_dev, (source_)))
     ESP32_I2S_STUB("esp32.i2s0",  DR_REG_I2S_BASE,  ETS_I2S0_INTR_SOURCE);
     ESP32_I2S_STUB("esp32.i2s1",  DR_REG_I2S1_BASE, ETS_I2S1_INTR_SOURCE);
@@ -778,10 +794,235 @@ struct Esp32MachineState {
     DeviceState *flash_dev;
     char *radio_config;
     char *radio_air_chardev;
+    char *phy_bypass_elf;
 };
 #define TYPE_ESP32_MACHINE MACHINE_TYPE_NAME("esp32")
 
 OBJECT_DECLARE_SIMPLE_TYPE(Esp32MachineState, ESP32_MACHINE)
+
+typedef struct Esp32PhyBypassState {
+    bool enabled;
+    uint32_t patched_count;
+    uint32_t patch_count;
+    struct {
+        const char *symbol;
+        uint32_t addr;
+        uint32_t return_value;
+        bool repatchable;
+        bool patched;
+    } patches[24];
+    AddressSpace *as[ESP32_CPU_COUNT];
+} Esp32PhyBypassState;
+
+static Esp32PhyBypassState esp32_phy_bypass;
+
+static bool esp32_phy_bypass_resolve_symbol(const char *elf_path,
+                                            const char *symbol,
+                                            uint32_t *addr)
+{
+    g_autofree gchar *contents = NULL;
+    g_autofree gchar *wanted_file = NULL;
+    const char *wanted_symbol = symbol;
+    gsize len = 0;
+
+    const char *colon = strchr(symbol, ':');
+    if (colon) {
+        wanted_file = g_strndup(symbol, colon - symbol);
+        wanted_symbol = colon + 1;
+    }
+
+    if (!g_file_get_contents(elf_path, &contents, &len, NULL)) {
+        return false;
+    }
+    if (len < sizeof(Elf32_Ehdr)) {
+        return false;
+    }
+
+    const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)contents;
+    if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0 ||
+        ehdr->e_ident[EI_CLASS] != ELFCLASS32 ||
+        ehdr->e_ident[EI_DATA] != ELFDATA2LSB ||
+        ehdr->e_machine != EM_XTENSA ||
+        ehdr->e_shentsize != sizeof(Elf32_Shdr) ||
+        ehdr->e_shoff > len ||
+        (uint64_t)ehdr->e_shoff + (uint64_t)ehdr->e_shnum * sizeof(Elf32_Shdr) > len) {
+        return false;
+    }
+
+    const Elf32_Shdr *shdr = (const Elf32_Shdr *)(contents + ehdr->e_shoff);
+    for (int i = 0; i < ehdr->e_shnum; i++) {
+        if (shdr[i].sh_type != SHT_SYMTAB && shdr[i].sh_type != SHT_DYNSYM) {
+            continue;
+        }
+        if (shdr[i].sh_entsize != sizeof(Elf32_Sym) ||
+            shdr[i].sh_link >= ehdr->e_shnum ||
+            shdr[i].sh_offset > len ||
+            shdr[i].sh_size > len - shdr[i].sh_offset) {
+            continue;
+        }
+
+        const Elf32_Shdr *strsec = &shdr[shdr[i].sh_link];
+        if (strsec->sh_offset > len || strsec->sh_size > len - strsec->sh_offset) {
+            continue;
+        }
+
+        const Elf32_Sym *syms = (const Elf32_Sym *)(contents + shdr[i].sh_offset);
+        const char *strtab = contents + strsec->sh_offset;
+        size_t count = shdr[i].sh_size / sizeof(Elf32_Sym);
+        const char *current_file = NULL;
+
+        for (size_t j = 0; j < count; j++) {
+            if (syms[j].st_name >= strsec->sh_size) {
+                continue;
+            }
+            const char *name = strtab + syms[j].st_name;
+            if (ELF32_ST_TYPE(syms[j].st_info) == STT_FILE) {
+                current_file = name;
+                continue;
+            }
+            if (wanted_file && g_strcmp0(current_file, wanted_file) != 0) {
+                continue;
+            }
+            if (strcmp(name, wanted_symbol) == 0 && syms[j].st_value != 0) {
+                *addr = syms[j].st_value;
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static void esp32_phy_bypass_configure(Esp32SocState *ss, const char *elf_path)
+{
+    static const char * const symbols[] = {
+        "esp_phy_load_cal_and_init",
+        "register_chipv7_phy",
+        "esp_restart",
+        "esp_restart_noos",
+        "esp_restart_noos_dig",
+        "i2s_driver_install",
+        "i2s_set_pin",
+        "i2s_zero_dma_buffer",
+        "i2s_stop",
+        "i2s_start",
+        "i2s_write",
+        "_Z11devicesInitv$part$0",
+        "devRGB.cpp:_ZL10initializev",
+        "_Z10WS281Binitv",
+        "_Z12WS281BsetLEDij",
+        "_Z12WS281BsetLEDj",
+    };
+
+    memset(&esp32_phy_bypass, 0, sizeof(esp32_phy_bypass));
+    if (!elf_path || !*elf_path) {
+        return;
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(symbols); i++) {
+        uint32_t addr = 0;
+
+        if (!esp32_phy_bypass_resolve_symbol(elf_path, symbols[i], &addr)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP32: phy-bypass-elf=%s did not contain %s\n",
+                          elf_path, symbols[i]);
+            continue;
+        }
+
+        esp32_phy_bypass.patches[esp32_phy_bypass.patch_count].symbol = symbols[i];
+        esp32_phy_bypass.patches[esp32_phy_bypass.patch_count].addr = addr;
+        esp32_phy_bypass.patches[esp32_phy_bypass.patch_count].return_value =
+            strcmp(symbols[i], "regi2c_ctrl_read_reg_mask") == 0 ? 1 : 0;
+        esp32_phy_bypass.patch_count++;
+    }
+
+    if (esp32_phy_bypass.patch_count == 0) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32: phy-bypass-elf=%s did not contain any known "
+                      "PHY entrypoints; PHY bypass disabled\n",
+                      elf_path);
+        return;
+    }
+
+    esp32_phy_bypass.enabled = true;
+    for (int i = 0; i < ESP32_CPU_COUNT; i++) {
+        esp32_phy_bypass.as[i] = CPU(&ss->cpu[i])->as;
+    }
+    for (uint32_t i = 0; i < esp32_phy_bypass.patch_count; i++) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32: phy bypass armed from %s: %s=0x%08x\n",
+                      elf_path, esp32_phy_bypass.patches[i].symbol,
+                      esp32_phy_bypass.patches[i].addr);
+    }
+}
+
+void esp32_phy_bypass_try_apply(void)
+{
+    static const uint8_t stub_ret0[] = {
+        0x36, 0x41, 0x00,  /* entry a1, 32 */
+        0x0c, 0x02,        /* movi.n a2, 0 */
+        0x1d, 0xf0,        /* retw.n */
+    };
+    static const uint8_t stub_ret1[] = {
+        0x36, 0x41, 0x00,  /* entry a1, 32 */
+        0x0c, 0x12,        /* movi.n a2, 1 */
+        0x1d, 0xf0,        /* retw.n */
+    };
+    uint8_t check[sizeof(stub_ret0)];
+
+    if (!esp32_phy_bypass.enabled) {
+        return;
+    }
+
+    for (uint32_t patch = 0; patch < esp32_phy_bypass.patch_count; patch++) {
+        if (esp32_phy_bypass.patches[patch].patched &&
+            !esp32_phy_bypass.patches[patch].repatchable) {
+            continue;
+        }
+
+        for (int i = 0; i < ESP32_CPU_COUNT; i++) {
+            if (!esp32_phy_bypass.as[i]) {
+                return;
+            }
+        }
+
+        if (address_space_read(esp32_phy_bypass.as[0],
+                               esp32_phy_bypass.patches[patch].addr,
+                               MEMTXATTRS_UNSPECIFIED, check, sizeof(check)) == MEMTX_OK &&
+            memcmp(check,
+                   esp32_phy_bypass.patches[patch].return_value ?
+                       stub_ret1 : stub_ret0,
+                   sizeof(check)) == 0) {
+            continue;
+        }
+
+        const uint8_t *stub = esp32_phy_bypass.patches[patch].return_value ?
+            stub_ret1 : stub_ret0;
+        bool was_patched = esp32_phy_bypass.patches[patch].patched;
+        for (int i = 0; i < ESP32_CPU_COUNT; i++) {
+            address_space_write_rom(esp32_phy_bypass.as[i],
+                                    esp32_phy_bypass.patches[patch].addr,
+                                    MEMTXATTRS_UNSPECIFIED, stub, sizeof(stub_ret0));
+            tb_flush(qemu_get_cpu(i));
+        }
+
+        if (address_space_read(esp32_phy_bypass.as[0],
+                               esp32_phy_bypass.patches[patch].addr,
+                               MEMTXATTRS_UNSPECIFIED, check, sizeof(check)) == MEMTX_OK &&
+            memcmp(check, stub, sizeof(check)) == 0) {
+            esp32_phy_bypass.patches[patch].patched = true;
+            if (!was_patched) {
+                esp32_phy_bypass.patched_count++;
+            }
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP32: %s %s at 0x%08x "
+                          "(returns ESP_OK; firmware image unchanged)\n",
+                          esp32_phy_bypass.patches[patch].symbol,
+                          was_patched ? "re-patched" : "patched",
+                          esp32_phy_bypass.patches[patch].addr);
+        }
+    }
+}
 
 
 static void esp32_machine_init_spi_flash(Esp32SocState *ss, BlockBackend* blk)
@@ -872,10 +1113,11 @@ static void esp32_machine_connect_radio_dio(Esp32SocState *ss,
         return;
     }
 
-    qdev_connect_gpio_out_named(radio, gpio_name, dio_index,
-                                qdev_get_gpio_in_named(DEVICE(&ss->gpio),
-                                                       ESP32_GPIO_IN_GPIO,
-                                                       gpio_pin));
+    qemu_irq gpio_input = qdev_get_gpio_in_named(DEVICE(&ss->gpio),
+                                                 ESP32_GPIO_IN_GPIO,
+                                                 gpio_pin);
+    qdev_connect_gpio_out_named(radio, gpio_name, dio_index, gpio_input);
+    qemu_set_irq(gpio_input, 0);
     qemu_log("ESP32 radio DIO: chip[%d].%s -> gpio=%d\n",
              chip_index, label, gpio_pin);
 }
@@ -894,10 +1136,11 @@ static void esp32_machine_connect_radio_busy(Esp32SocState *ss,
         return;
     }
 
-    qdev_connect_gpio_out_named(radio, gpio_name, 0,
-                                qdev_get_gpio_in_named(DEVICE(&ss->gpio),
-                                                       ESP32_GPIO_IN_GPIO,
-                                                       gpio_pin));
+    qemu_irq gpio_input = qdev_get_gpio_in_named(DEVICE(&ss->gpio),
+                                                 ESP32_GPIO_IN_GPIO,
+                                                 gpio_pin);
+    qdev_connect_gpio_out_named(radio, gpio_name, 0, gpio_input);
+    qemu_set_irq(gpio_input, 0);
     qemu_log("ESP32 radio BUSY: chip[%d].busy -> gpio=%d\n",
              chip_index, gpio_pin);
 }
@@ -1128,6 +1371,7 @@ static void esp32_machine_init(MachineState *machine)
     }
 
     qdev_realize(DEVICE(ss), NULL, &error_fatal);
+    esp32_phy_bypass_configure(ss, ms->phy_bypass_elf);
 
     if (blk) {
         esp32_machine_init_spi_flash(ss, blk);
@@ -1236,6 +1480,20 @@ static ram_addr_t esp32_fixup_ram_size(ram_addr_t requested_size)
 
 ESP_RADIO_OPTIONS_DEFINE_ACCESSORS(esp32_machine, Esp32MachineState, ESP32_MACHINE)
 
+static char *esp32_machine_get_phy_bypass_elf(Object *obj, Error **errp)
+{
+    Esp32MachineState *ms = ESP32_MACHINE(obj);
+    return g_strdup(ms->phy_bypass_elf);
+}
+
+static void esp32_machine_set_phy_bypass_elf(Object *obj, const char *value,
+                                             Error **errp)
+{
+    Esp32MachineState *ms = ESP32_MACHINE(obj);
+    g_free(ms->phy_bypass_elf);
+    ms->phy_bypass_elf = g_strdup(value);
+}
+
 /* Initialize machine type */
 static void esp32_machine_class_init(ObjectClass *oc, void *data)
 {
@@ -1248,6 +1506,14 @@ static void esp32_machine_class_init(ObjectClass *oc, void *data)
     mc->fixup_ram_size = esp32_fixup_ram_size;
 
     ESP_RADIO_OPTIONS_ADD_PROPS(oc, esp32_machine);
+    object_class_property_add_str(oc, "phy-bypass-elf",
+                                  esp32_machine_get_phy_bypass_elf,
+                                  esp32_machine_set_phy_bypass_elf);
+    object_class_property_set_description(oc, "phy-bypass-elf",
+        "Developer-side ESP32 ELF used to locate register_chipv7_phy and "
+        "patch that function in runtime memory so QEMU can bypass the "
+        "proprietary Wi-Fi PHY calibration path. The flash image is not "
+        "modified.");
 }
 
 static const TypeInfo esp32_info = {

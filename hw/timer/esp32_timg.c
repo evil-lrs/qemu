@@ -20,7 +20,9 @@
 #include "hw/registerfields.h"
 #include "hw/boards.h"
 #include "hw/timer/esp32_timg.h"
+#include "hw/core/cpu.h"
 
+void esp32_phy_bypass_try_apply(void);
 
 #define TIMG_REGFILE_SIZE 0x100
 
@@ -39,6 +41,16 @@ static bool esp32_timg_wdt_active(Esp32TimgWdtState *ws);
 
 
 #define TIMG_DEBUG_LOG(...) // qemu_log(__VA_ARGS__)
+
+static bool esp32_timg_trace_enabled(void)
+{
+    return getenv("QEMU_ESP32_TIMG_TRACE") != NULL;
+}
+
+static bool esp32_timg_wdt_env_disabled(void)
+{
+    return getenv("QEMU_ESP32_DISABLE_WDT") != NULL;
+}
 
 static const char *esp32_timg_reg_name(hwaddr addr)
 {
@@ -114,6 +126,9 @@ static uint32_t esp32_timg_int_st(Esp32TimgState *s)
 
 static void esp32_timg_log_int_regs(Esp32TimgState *s, const char *why)
 {
+    if (!esp32_timg_trace_enabled()) {
+        return;
+    }
     qemu_log_mask(LOG_GUEST_ERROR,
                   "ESP32_TIMG%d: %s INT_ENA=0x%08x INT_RAW=0x%08x "
                   "INT_ST=0x%08x\n",
@@ -208,7 +223,7 @@ static uint64_t esp32_timg_read(void *opaque, hwaddr addr, unsigned int size)
         r = esp32_timg_int_st(s);
         break;
     }
-    if (esp32_timg_log_reg(addr)) {
+    if (esp32_timg_trace_enabled() && esp32_timg_log_reg(addr)) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "ESP32_TIMG%d: read %s(0x%" HWADDR_PRIx ") -> 0x%"
                       PRIx64 "\n",
@@ -220,6 +235,8 @@ static uint64_t esp32_timg_read(void *opaque, hwaddr addr, unsigned int size)
 static void esp32_timg_write(void *opaque, hwaddr addr,
                        uint64_t value, unsigned int size)
 {
+    esp32_phy_bypass_try_apply();
+
     Esp32TimgState *s = ESP32_TIMG(opaque);
     Esp32TimgTimerState *ts = NULL;
     if (addr <= A_TIMG_T0LOAD) {
@@ -311,7 +328,8 @@ static void esp32_timg_write(void *opaque, hwaddr addr,
         s->rtc_cal_ready = FIELD_EX32(value, TIMG_RTCCALICFG, RDY);
         s->rtc_cal_clk_sel = FIELD_EX32(value, TIMG_RTCCALICFG, CLK_SEL);
         s->rtc_cal_max = FIELD_EX32(value, TIMG_RTCCALICFG, MAX);
-        if (s->rtc_cal_start && !s->rtc_cal_logged_start) {
+        if (esp32_timg_trace_enabled() &&
+            s->rtc_cal_start && !s->rtc_cal_logged_start) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "ESP32_TIMG%d: RTC calibration start max=%u "
                           "clk_sel=%u\n",
@@ -334,7 +352,7 @@ static void esp32_timg_write(void *opaque, hwaddr addr,
         esp32_timg_log_int_regs(s, "write INT_CLR");
         break;
     }
-    if (esp32_timg_log_reg(addr)) {
+    if (esp32_timg_trace_enabled() && esp32_timg_log_reg(addr)) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "ESP32_TIMG%d: write %s(0x%" HWADDR_PRIx ") = 0x%"
                       PRIx64 "\n",
@@ -428,7 +446,7 @@ static void esp32_timg_do_calibration(Esp32TimgState* s)
 
     s->rtc_cal_value = muldiv64(s->xtal_freq_hz, s->rtc_cal_max, cal_clk_freq);
     s->rtc_cal_ready = true;
-    if (!s->rtc_cal_logged_ready) {
+    if (esp32_timg_trace_enabled() && !s->rtc_cal_logged_ready) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "ESP32_TIMG%d: RTC calibration ready value=0x%08x "
                       "max=%u clk_sel=%u\n",
@@ -447,17 +465,22 @@ static void esp32_timg_timer_cb(void *opaque)
     TIMG_DEBUG_LOG("%s: TG%d ns=0x%llx\n", __func__, s->id, ns_now);
     uint32_t int_mask = 1 << (ts->int_type);
 
-    qemu_log_mask(LOG_GUEST_ERROR,
-                  "ESP32_TIMG%d_%s: ALARM count=0x%016" PRIx64 " "
-                  "alarm=0x%016" PRIx64 " ns_now=0x%016" PRIx64 " "
-                  "level_en=%d edge_en=%d int_ena=0x%08x raw=0x%08x\n",
-                  s->id, esp32_timg_int_name(ts->int_type),
-                  esp32_timg_timer_get_count(ts, ns_now), ts->alarm_val,
-                  ns_now, ts->level_int_en, ts->edge_int_en, s->int_ena,
-                  s->int_raw);
+    if (esp32_timg_trace_enabled()) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32_TIMG%d_%s: ALARM count=0x%016" PRIx64 " "
+                      "alarm=0x%016" PRIx64 " ns_now=0x%016" PRIx64 " "
+                      "level_en=%d edge_en=%d int_ena=0x%08x raw=0x%08x\n",
+                      s->id, esp32_timg_int_name(ts->int_type),
+                      esp32_timg_timer_get_count(ts, ns_now), ts->alarm_val,
+                      ns_now, ts->level_int_en, ts->edge_int_en, s->int_ena,
+                      s->int_raw);
+    }
+
+    if (ts->level_int_en || ts->edge_int_en) {
+        s->int_raw |= int_mask;
+    }
 
     if (ts->level_int_en) {
-        s->int_raw |= int_mask;
         if (s->int_ena & int_mask) {
             qemu_irq_raise(get_level_irq(s, ts->int_type));
             esp32_timg_log_int_regs(s, "alarm raise level IRQ");
@@ -466,16 +489,16 @@ static void esp32_timg_timer_cb(void *opaque)
 
     if (ts->edge_int_en) {
         if (s->int_ena & int_mask) {
+            esp32_timg_log_int_regs(s, "alarm pulse edge IRQ");
             qemu_irq_pulse(get_edge_irq(s, ts->int_type));
         }
     }
-
-    ts->alarm = false;
 
     if (ts->autoreload) {
         esp32_timg_timer_reload(ts, ns_now);
     } else {
         /* ignore overflow modulo 64 bits */
+        ts->alarm = false;
         timer_del(&ts->alarm_timer);
     }
 }
@@ -551,14 +574,15 @@ static void esp32_timg_timer_update_config(Esp32TimgTimerState *ts)
     ts->level_int_en = FIELD_EX32(ts->config_reg, TIMG_T0CONFIG, LEVEL_INT);
     ts->alarm = FIELD_EX32(ts->config_reg, TIMG_T0CONFIG, ALARM);
 
-    if (!ts->logged_config_valid ||
+    if (esp32_timg_trace_enabled() &&
+        (!ts->logged_config_valid ||
         ((ts->logged_config_reg ^ ts->config_reg) &
          (R_TIMG_T0CONFIG_EN_MASK |
           R_TIMG_T0CONFIG_AUTORELOAD_MASK |
           R_TIMG_T0CONFIG_DIVIDER_MASK |
           R_TIMG_T0CONFIG_EDGE_INT_MASK |
           R_TIMG_T0CONFIG_LEVEL_INT_MASK |
-          R_TIMG_T0CONFIG_ALARM_MASK))) {
+          R_TIMG_T0CONFIG_ALARM_MASK)))) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "ESP32_TIMG%d_%s: CONFIG reg=0x%08x count=0x%016"
                       PRIx64 " alarm=0x%016" PRIx64 " ns=0x%016" PRIx64
@@ -595,7 +619,8 @@ static void esp32_timg_timer_reload(Esp32TimgTimerState *ts, uint64_t ns_now)
 
 static void esp32_timg_timer_update_alarm(Esp32TimgTimerState *ts, uint64_t ns_now)
 {
-    if (!ts->logged_alarm_valid || ts->logged_alarm_val != ts->alarm_val) {
+    if (esp32_timg_trace_enabled() &&
+        (!ts->logged_alarm_valid || ts->logged_alarm_val != ts->alarm_val)) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "ESP32_TIMG%d_%s: ALARM_SET alarm=0x%016" PRIx64
                       " count=0x%016" PRIx64 " ns=0x%016" PRIx64 "\n",
@@ -613,6 +638,18 @@ static void esp32_timg_timer_update_alarm(Esp32TimgTimerState *ts, uint64_t ns_n
     int64_t count_to_alarm = ((int64_t) ts->alarm_val - (int64_t) ts->count_base)
                                 * esp32_timg_timer_direction(ts);
     if (count_to_alarm <= 0) {
+        if (ts->autoreload) {
+            ts->ns_base = ns_now;
+            ts->count_base = ts->load_val;
+            count_to_alarm = ((int64_t) ts->alarm_val - (int64_t) ts->count_base)
+                                * esp32_timg_timer_direction(ts);
+            if (count_to_alarm > 0) {
+                uint64_t ns_to_alarm =
+                    esp32_timg_timer_count_to_ns(ts, count_to_alarm);
+                timer_mod_ns(&ts->alarm_timer, ns_now + ns_to_alarm);
+                return;
+            }
+        }
         /* ignore overflow modulo 64 bits */
         timer_del(&ts->alarm_timer);
         return;
@@ -623,7 +660,7 @@ static void esp32_timg_timer_update_alarm(Esp32TimgTimerState *ts, uint64_t ns_n
     TIMG_DEBUG_LOG("%s: TG%d count_to_alarm=0x%llx ns_to_alarm=0x%llx\n", __func__, ts->parent->id,
                  count_to_alarm, ns_to_alarm);
 
-    timer_mod_anticipate_ns(&ts->alarm_timer, ns_now + ns_to_alarm);
+    timer_mod_ns(&ts->alarm_timer, ns_now + ns_to_alarm);
 }
 
 static bool esp32_timg_wdt_protected(Esp32TimgWdtState *ws)
@@ -634,6 +671,7 @@ static bool esp32_timg_wdt_protected(Esp32TimgWdtState *ws)
 static bool esp32_timg_wdt_active(Esp32TimgWdtState *ws)
 {
     return !ws->parent->wdt_disable &&
+           !esp32_timg_wdt_env_disabled() &&
            (ws->en || (ws->flashboot_en && ws->parent->flash_boot_mode));
 }
 
@@ -743,15 +781,26 @@ static void esp32_timg_wdt_cb(void *opaque)
         return;
     }
 
+    CPUState *cpu0 = qemu_get_cpu(0);
+    CPUState *cpu1 = qemu_get_cpu(1);
+    uint32_t pc0 = (cpu0 && CPU_GET_CLASS(cpu0)->get_pc) ?
+        CPU_GET_CLASS(cpu0)->get_pc(cpu0) : 0;
+    uint32_t pc1 = (cpu1 && CPU_GET_CLASS(cpu1)->get_pc) ?
+        CPU_GET_CLASS(cpu1)->get_pc(cpu1) : 0;
+
     qemu_log_mask(LOG_GUEST_ERROR,
                   "ESP32_TIMG%d_WDT: TRIGGER stage=%d mode=%d "
                   "config0=0x%08x enabled=%d flashboot_en=%d "
                   "flash_boot_mode=%d prescale=%d "
-                  "timeouts=[0x%x,0x%x,0x%x,0x%x]\n",
+                  "timeouts=[0x%x,0x%x,0x%x,0x%x] cpu=%d pc=0x%08" PRIx64
+                  " cpu0pc=0x%08x cpu1pc=0x%08x\n",
                   s->id, ws->cur_stage, mode, ws->config0_reg, ws->en,
                   ws->flashboot_en, s->flash_boot_mode, ws->prescale,
                   ws->timeout[0], ws->timeout[1], ws->timeout[2],
-                  ws->timeout[3]);
+                  ws->timeout[3],
+                  current_cpu ? current_cpu->cpu_index : -1,
+                  current_cpu ? current_cpu->mem_io_pc : 0,
+                  pc0, pc1);
     if (mode == WDT_MODE_INT) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "ESP32_TIMG%d_WDT: auto-feed interrupt stage=%d "

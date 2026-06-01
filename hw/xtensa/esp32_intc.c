@@ -17,10 +17,41 @@
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "hw/xtensa/esp32_intc.h"
+#include "hw/misc/esp32_reg.h"
 
 #define INTMATRIX_UNINT_VALUE   6
 
 #define IRQ_MAP(cpu, input) s->irq_map[cpu][input]
+
+static bool esp32_intmatrix_trace_enabled(void)
+{
+    return getenv("QEMU_ESP32_INTMATRIX_TRACE") != NULL;
+}
+
+static bool esp32_intmatrix_trace_source(int source)
+{
+    const char *source_filter;
+    char *endptr;
+    long filtered_source;
+
+    if (!esp32_intmatrix_trace_enabled()) {
+        return false;
+    }
+
+    source_filter = getenv("QEMU_ESP32_INTMATRIX_TRACE_SOURCE");
+    if (source_filter && source_filter[0]) {
+        filtered_source = strtol(source_filter, &endptr, 0);
+        return *endptr == '\0' && source == filtered_source;
+    }
+
+    return source == ETS_GPIO_INTR_SOURCE ||
+           (source >= ETS_TG0_T0_LEVEL_INTR_SOURCE &&
+            source <= ETS_TG1_LACT_LEVEL_INTR_SOURCE) ||
+           (source >= ETS_TG0_T0_EDGE_INTR_SOURCE &&
+            source <= ETS_TG1_LACT_EDGE_INTR_SOURCE) ||
+           (source >= ETS_FROM_CPU_INTR0_SOURCE &&
+            source <= ETS_FROM_CPU_INTR3_SOURCE);
+}
 
 static void esp32_intmatrix_irq_handler(void *opaque, int n, int level)
 {
@@ -30,8 +61,19 @@ static void esp32_intmatrix_irq_handler(void *opaque, int n, int level)
             continue;
         }
         int out_index = IRQ_MAP(i, n);
+        if (esp32_intmatrix_trace_source(n)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP32_INTMATRIX: source=%d level=%d cpu=%d out=%d\n",
+                          n, level, i, out_index);
+        }
         for (int int_index = 0; int_index < s->cpu[i]->env.config->nextint; ++int_index) {
             if (s->cpu[i]->env.config->extint[int_index] == out_index) {
+                if (esp32_intmatrix_trace_source(n)) {
+                    qemu_log_mask(LOG_GUEST_ERROR,
+                                  "ESP32_INTMATRIX: deliver source=%d cpu=%d "
+                                  "extint=%d out=%d level=%d\n",
+                                  n, i, int_index, out_index, level);
+                }
                 qemu_set_irq(s->outputs[i][int_index], level);
                 break;
             }
@@ -64,6 +106,14 @@ static void esp32_intmatrix_write(void* opaque, hwaddr addr, uint64_t value, uns
     uint8_t* map_entry = get_map_entry(s, addr);
     if (map_entry != NULL) {
         *map_entry = value & 0x1f;
+        int source_index = addr / sizeof(uint32_t);
+        int cpu_index = source_index / ESP32_INT_MATRIX_INPUTS;
+        source_index = source_index % ESP32_INT_MATRIX_INPUTS;
+        if (esp32_intmatrix_trace_source(source_index)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP32_INTMATRIX: map cpu=%d source=%d -> out=%u\n",
+                          cpu_index, source_index, (unsigned)(value & 0x1f));
+        }
     }
 }
 
