@@ -5,6 +5,7 @@
 #include "hw/xtensa/xtensa_memory.h"
 #include "chardev/char-fe.h"
 #include "hw/ssi/ssi.h"
+#include "qemu/timer.h"
 #include "target/xtensa/cpu.h"
 
 #define ESP8266_CPU_COUNT 1
@@ -34,6 +35,7 @@ typedef struct Esp8266SocState {
     MemoryRegion gpio;
     MemoryRegion spi;
     MemoryRegion flash_helper;
+    MemoryRegion ets_scratch;
     MemoryRegion wdt;
     MemoryRegion i2c;
     MemoryRegion timer0;
@@ -42,11 +44,15 @@ typedef struct Esp8266SocState {
     MemoryRegion iomux;
     MemoryRegion sys;
     MemoryRegion wifi;
+    MemoryRegion sdk_time_guard;
 
     CharBackend uart0_chr;
     XtensaCPU cpu[ESP8266_CPU_COUNT];
     SSIBus *hspi_bus;
     qemu_irq hspi_cs;
+    QEMUTimer *frc1_timer;
+    QEMUTimer *ets_pump_timer;
+    uint32_t radio_dio_mask;
     uint8_t spi_flash_status1;
     uint8_t spi_flash_status2;
     uint32_t flash_helper_addr;
@@ -60,6 +66,9 @@ typedef struct Esp8266SocState {
     uint32_t wifi_regs[ESP8266_WIFI_MMIO_WORDS];
     uint32_t hspi_regs[ESP8266_HSPI_MMIO_WORDS];
     uint32_t sys_regs[ESP8266_SYS_MMIO_WORDS];
+    uint64_t sdk_time_guard_us;
+    uint8_t low_scratch_data[0x100000];
+    uint8_t ets_scratch_data[0x400];
     uint32_t boot_entry;
     bool boot_loaded;
 } Esp8266SocState;
