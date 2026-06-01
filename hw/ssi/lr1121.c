@@ -968,9 +968,9 @@ static uint8_t lr1121_response_byte(LR1121State *s)
     case LR1121_OP_GET_VERSION:
         if (i == 0) res = s->status1;
         else if (i == 1) res = 0x01; /* hw */
-        else if (i == 2) res = 0xf3; /* transceiver firmware type */
+        else if (i == 2) res = 0x03; /* transceiver firmware type */
         else if (i == 3) res = 0x01; /* fw major */
-        else if (i == 4) res = 0x04; /* fw minor */
+        else if (i == 4) res = 0x01; /* fw minor */
         break;
 
     case LR1121_OP_GET_ERRORS:

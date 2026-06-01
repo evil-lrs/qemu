@@ -19,6 +19,8 @@
 void esp32_wifi_stub_add_region(const char *name, hwaddr dport_base,
                                 hwaddr apb_base, size_t size,
                                 uint32_t default_val);
+void esp32_wifi_stub_add_region_single(const char *name, hwaddr base,
+                                       size_t size, uint32_t default_val);
 
 /*
  * Same as esp32_wifi_stub_add_region(), but bits set in @self_clear_mask
@@ -43,3 +45,6 @@ void esp32_wifi_stub_add_region_self_clear(const char *name,
 void esp32_wifi_stub_add_i2s_region(const char *name, hwaddr dport_base,
                                     hwaddr apb_base, size_t size,
                                     uint32_t default_val, qemu_irq irq);
+void esp32_wifi_stub_add_i2s_region_single(const char *name, hwaddr base,
+                                           size_t size, uint32_t default_val,
+                                           qemu_irq irq);

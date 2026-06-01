@@ -53,6 +53,7 @@
 #include "hw/dma/esp32c3_gdma.h"
 #include "hw/display/esp_rgb.h"
 #include "hw/net/can/esp32c3_twai.h"
+#include "hw/misc/esp32_wifi_stub.h"
 #include "hw/misc/esp_radio_config.h"
 #include "hw/misc/esp_radio_board.h"
 
@@ -425,6 +426,28 @@ static void esp32c3_init_openeth(Esp32C3MachineState *ms)
 
 }
 
+static void esp32c3_init_peripheral_stubs(DeviceState *intmatrix_dev)
+{
+#define ESP32C3_STUB(name_, base_, size_, default_) \
+    esp32_wifi_stub_add_region_single((name_), (base_), (size_), (default_))
+
+    ESP32C3_STUB("esp32c3.fe2",    DR_REG_FE2_BASE,       0x1000, 0xffffffff);
+    ESP32C3_STUB("esp32c3.fe",     DR_REG_FE_BASE,        0x1000, 0xffffffff);
+    ESP32C3_STUB("esp32c3.iomux",  DR_REG_IO_MUX_BASE,    0x1000, 0xffffffff);
+    ESP32C3_STUB("esp32c3.i2c",    DR_REG_I2C_EXT_BASE,   0x1000, 0xffffffff);
+    ESP32C3_STUB("esp32c3.uhci0",  DR_REG_UHCI0_BASE,     0x1000, 0xffffffff);
+    ESP32C3_STUB("esp32c3.rmt",    DR_REG_RMT_BASE,       0x1000, 0xffffffff);
+    ESP32C3_STUB("esp32c3.ledc",   DR_REG_LEDC_BASE,      0x1000, 0xffffffff);
+    ESP32C3_STUB("esp32c3.bb",     DR_REG_BB_BASE - 0x1000, 0x3000, 0x00000000);
+    ESP32C3_STUB("esp32c3.saradc", DR_REG_APB_SARADC_BASE, 0x1000, 0x00000000);
+
+#undef ESP32C3_STUB
+
+    esp32_wifi_stub_add_i2s_region_single(
+        "esp32c3.i2s0", DR_REG_I2S0_BASE, 0x1000, 0x00000000,
+        qdev_get_gpio_in(intmatrix_dev, ETS_I2S1_INTR_SOURCE));
+}
+
 
 static void esp32c3_load_firmware(MachineState *machine)
 {
@@ -626,6 +649,8 @@ static void esp32c3_machine_init(MachineState *machine)
             qdev_connect_gpio_out_named(intmatrix_dev, ESP32C3_INT_MATRIX_OUTPUT_NAME, i, cpu_input);
         }
     }
+
+    esp32c3_init_peripheral_stubs(intmatrix_dev);
 
     /* Initialize OpenCores Ethernet controller now sicne it requires the interrupt matrix */
     esp32c3_init_openeth(ms);

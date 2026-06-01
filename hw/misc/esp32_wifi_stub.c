@@ -169,6 +169,22 @@ static void esp32_wifi_stub_add_region_internal(const char *name,
     g_free(apb_name);
 }
 
+void esp32_wifi_stub_add_region_single(const char *name, hwaddr base,
+                                       size_t size, uint32_t default_val)
+{
+    MemoryRegion *sys_mem = get_system_memory();
+    WifiStubRegion *r = g_new0(WifiStubRegion, 1);
+    r->name = g_strdup(name);
+    r->words = size / 4;
+    r->storage = g_new0(uint32_t, r->words);
+    r->touched = g_new0(bool, r->words);
+    r->default_val = default_val;
+
+    MemoryRegion *mr = g_new0(MemoryRegion, 1);
+    memory_region_init_io(mr, NULL, &wifi_stub_ops, r, r->name, size);
+    memory_region_add_subregion_overlap(sys_mem, base, mr, 1);
+}
+
 void esp32_wifi_stub_add_region(const char *name, hwaddr dport_base,
                                 hwaddr apb_base, size_t size,
                                 uint32_t default_val)
@@ -209,4 +225,22 @@ void esp32_wifi_stub_add_i2s_region(const char *name, hwaddr dport_base,
     memory_region_init_io(mr_apb, NULL, &wifi_stub_ops, r, apb_name, size);
     memory_region_add_subregion_overlap(sys_mem, apb_base, mr_apb, 0);
     g_free(apb_name);
+}
+
+void esp32_wifi_stub_add_i2s_region_single(const char *name, hwaddr base,
+                                           size_t size, uint32_t default_val,
+                                           qemu_irq irq)
+{
+    MemoryRegion *sys_mem = get_system_memory();
+    WifiStubRegion *r = g_new0(WifiStubRegion, 1);
+    r->name = g_strdup(name);
+    r->words = size / 4;
+    r->storage = g_new0(uint32_t, r->words);
+    r->touched = g_new0(bool, r->words);
+    r->default_val = default_val;
+    r->irq = irq;
+
+    MemoryRegion *mr = g_new0(MemoryRegion, 1);
+    memory_region_init_io(mr, NULL, &wifi_stub_ops, r, r->name, size);
+    memory_region_add_subregion_overlap(sys_mem, base, mr, 1);
 }
