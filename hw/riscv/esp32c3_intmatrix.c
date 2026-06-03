@@ -51,8 +51,19 @@ static bool esp32c3_intmatrix_line_should_assert(ESP32C3IntMatrixState *s, int l
         return false;
     }
 
+    if (BIT_SET(s->irq_trigger, line)) {
+        return false;
+    }
+
     return BIT_SET(s->irq_enabled, line) &&
            esp32c3_get_output_line_level(s, line) != 0 &&
+           (s->irq_prio[line] >= s->irq_thres);
+}
+
+static bool esp32c3_intmatrix_line_can_interrupt(ESP32C3IntMatrixState *s, int line)
+{
+    return line != 0 &&
+           BIT_SET(s->irq_enabled, line) &&
            (s->irq_prio[line] >= s->irq_thres);
 }
 
@@ -101,7 +112,12 @@ static void esp32c3_intmatrix_irq_handler(void *opaque, int n, int level)
     /* Nothing to do if the level is unchanged. */
     if (former_level != level) {
         const int line = s->irq_map[n];
-        esp32c3_intmatrix_update_line(s, line);
+        if (level && BIT_SET(s->irq_trigger, line) &&
+            esp32c3_intmatrix_line_can_interrupt(s, line)) {
+            qemu_irq_pulse(s->out_irqs[line]);
+        } else {
+            esp32c3_intmatrix_update_line(s, line);
+        }
     }
 }
 
@@ -122,7 +138,7 @@ static uint64_t esp32c3_intmatrix_read(void* opaque, hwaddr addr, unsigned int s
     }  else if (index == ESP32C3_INTMATRIX_IO_ENABLE_REG) {
         r = s->irq_enabled;
     } else if (index == ESP32C3_INTMATRIX_IO_TYPE_REG) {
-        r = 0;
+        r = s->irq_trigger;
     } else {
 #if INTMATRIX_WARNING
         /* Other registers are not supported yet */
@@ -200,10 +216,10 @@ static void esp32c3_intmatrix_write(void* opaque, hwaddr addr, uint64_t value, u
             }
         }
     } else if (index == ESP32C3_INTMATRIX_IO_TYPE_REG) {
-        if (value != 0) {
-#if INTMATRIX_WARNING
-            warn_report("[INTMATRIX] Edge-triggered interrupts not supported\n");
-#endif
+        uint64_t prev = s->irq_trigger;
+        s->irq_trigger = value;
+        if (prev != s->irq_trigger) {
+            esp32c3_intmatrix_refresh_all(s);
         }
     } else {
 #if INTMATRIX_WARNING

@@ -261,10 +261,11 @@ static void esp32c3_machine_connect_radio_dio(Esp32C3MachineState *ms,
         return;
     }
 
-    qdev_connect_gpio_out_named(radio, gpio_name, dio_index,
-                                qdev_get_gpio_in_named(DEVICE(&ms->gpio),
-                                                       ESP32_GPIO_IN_GPIO,
-                                                       gpio_pin));
+    qemu_irq gpio_input = qdev_get_gpio_in_named(DEVICE(&ms->gpio),
+                                                 ESP32_GPIO_IN_GPIO,
+                                                 gpio_pin);
+    qdev_connect_gpio_out_named(radio, gpio_name, dio_index, gpio_input);
+    qemu_set_irq(gpio_input, 0);
     qemu_log("ESP32-C3 radio DIO: chip[%d].%s -> gpio=%d\n",
              chip_index, label, gpio_pin);
 }
@@ -282,10 +283,11 @@ static void esp32c3_machine_connect_radio_busy(Esp32C3MachineState *ms,
         return;
     }
 
-    qdev_connect_gpio_out_named(radio, gpio_name, 0,
-                                qdev_get_gpio_in_named(DEVICE(&ms->gpio),
-                                                       ESP32_GPIO_IN_GPIO,
-                                                       gpio_pin));
+    qemu_irq gpio_input = qdev_get_gpio_in_named(DEVICE(&ms->gpio),
+                                                 ESP32_GPIO_IN_GPIO,
+                                                 gpio_pin);
+    qdev_connect_gpio_out_named(radio, gpio_name, 0, gpio_input);
+    qemu_set_irq(gpio_input, 0);
     qemu_log("ESP32-C3 radio BUSY: chip[%d].busy -> gpio=%d\n",
              chip_index, gpio_pin);
 }
@@ -363,6 +365,16 @@ static void esp32c3_machine_init_radios(Esp32C3MachineState *ms,
 
         qdev_prop_set_uint8(radio, "spi_id", 2);
         qdev_prop_set_uint8(radio, "cs", i);
+        if (cfg->type == ESP_RADIO_LR1121) {
+            if (cfg->lr1121_firmware_type >= 0) {
+                qdev_prop_set_uint8(radio, "firmware-type",
+                                    cfg->lr1121_firmware_type & 0xff);
+            }
+            if (cfg->lr1121_firmware_version >= 0) {
+                qdev_prop_set_uint16(radio, "firmware-version",
+                                     cfg->lr1121_firmware_version & 0xffff);
+            }
+        }
         if (air_chr && i == 0) {
             qdev_prop_set_chr(radio, "air-chardev", air_chr);
         }
@@ -436,16 +448,20 @@ static void esp32c3_init_peripheral_stubs(DeviceState *intmatrix_dev)
     ESP32C3_STUB("esp32c3.iomux",  DR_REG_IO_MUX_BASE,    0x1000, 0xffffffff);
     ESP32C3_STUB("esp32c3.i2c",    DR_REG_I2C_EXT_BASE,   0x1000, 0xffffffff);
     ESP32C3_STUB("esp32c3.uhci0",  DR_REG_UHCI0_BASE,     0x1000, 0xffffffff);
-    ESP32C3_STUB("esp32c3.rmt",    DR_REG_RMT_BASE,       0x1000, 0xffffffff);
     ESP32C3_STUB("esp32c3.ledc",   DR_REG_LEDC_BASE,      0x1000, 0xffffffff);
     ESP32C3_STUB("esp32c3.bb",     DR_REG_BB_BASE - 0x1000, 0x3000, 0x00000000);
-    ESP32C3_STUB("esp32c3.saradc", DR_REG_APB_SARADC_BASE, 0x1000, 0x00000000);
 
 #undef ESP32C3_STUB
 
     esp32_wifi_stub_add_i2s_region_single(
         "esp32c3.i2s0", DR_REG_I2S0_BASE, 0x1000, 0x00000000,
         qdev_get_gpio_in(intmatrix_dev, ETS_I2S1_INTR_SOURCE));
+    esp32_wifi_stub_add_i2s_region_single(
+        "esp32c3.rmt", DR_REG_RMT_BASE, 0x1000, 0x00000000,
+        qdev_get_gpio_in(intmatrix_dev, ETS_RMT_INTR_SOURCE));
+    esp32_wifi_stub_add_i2s_region_single(
+        "esp32c3.saradc", DR_REG_APB_SARADC_BASE, 0x1000, 0x00000000,
+        qdev_get_gpio_in(intmatrix_dev, ETS_APB_ADC_INTR_SOURCE));
 }
 
 
