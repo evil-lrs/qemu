@@ -18,6 +18,7 @@
 #include "hw/sysbus.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
+#include "hw/core/cpu.h"
 #include "hw/misc/esp32_reg.h"
 #include "hw/misc/esp32_rtc_cntl.h"
 
@@ -83,17 +84,26 @@ static void esp32_rtc_cntl_write(void *opaque, hwaddr addr, uint64_t value,
     switch (addr) {
     case A_RTC_CNTL_OPTIONS0:
         if (value & R_RTC_CNTL_OPTIONS0_SW_SYS_RESET_MASK) {
-            s->reset_cause[0] = ESP32_SW_SYS_RESET;
-            s->reset_cause[1] = ESP32_SW_SYS_RESET;
-            qemu_irq_pulse(s->dig_reset_req);
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP32_RTC_CNTL: suppress SW_SYS_RESET for firmware "
+                          "analysis value=0x%08" PRIx64 " pc=0x%08" PRIx64 "\n",
+                          value, current_cpu ? current_cpu->mem_io_pc : 0);
             value &= ~(R_RTC_CNTL_OPTIONS0_SW_SYS_RESET_MASK);
         }
         if (value & R_RTC_CNTL_OPTIONS0_SW_APPCPU_RESET_MASK) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP32_RTC_CNTL: SW_APPCPU_RESET value=0x%08" PRIx64
+                          " pc=0x%08" PRIx64 "\n",
+                          value, current_cpu ? current_cpu->mem_io_pc : 0);
             s->reset_cause[1] = ESP32_SW_CPU_RESET;
             qemu_irq_pulse(s->cpu_reset_req[1]);
             value &= ~(R_RTC_CNTL_OPTIONS0_SW_APPCPU_RESET_MASK);
         }
         if (value & R_RTC_CNTL_OPTIONS0_SW_PROCPU_RESET_MASK) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP32_RTC_CNTL: SW_PROCPU_RESET value=0x%08" PRIx64
+                          " pc=0x%08" PRIx64 "\n",
+                          value, current_cpu ? current_cpu->mem_io_pc : 0);
             s->reset_cause[0] = ESP32_SW_CPU_RESET;
             qemu_irq_pulse(s->cpu_reset_req[0]);
             value &= ~(R_RTC_CNTL_OPTIONS0_SW_PROCPU_RESET_MASK);

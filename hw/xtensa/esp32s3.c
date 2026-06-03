@@ -20,6 +20,8 @@
 #include "hw/sysbus.h"
 #include "hw/xtensa/xtensa_memory.h"
 #include "hw/misc/unimp.h"
+#include "hw/misc/esp_radio_config.h"
+#include "hw/misc/esp_radio_board.h"
 #include "hw/irq.h"
 #include "hw/i2c/i2c.h"
 #include "hw/qdev-properties.h"
@@ -318,6 +320,8 @@ struct Esp32s3MachineState {
 
     Esp32s3SocState esp32s3;
     DeviceState *flash_dev;
+    char *radio_config;
+    char *radio_air_chardev;
 };
 #define TYPE_ESP32S3_MACHINE MACHINE_TYPE_NAME("esp32s3")
 
@@ -614,6 +618,26 @@ static void esp32s3_machine_init(MachineState *machine)
 
     MemoryRegion *sys_mem = get_system_memory();
     Esp32s3MachineState *ms = ESP32S3_MACHINE(machine);
+    esp_radio_config_log("ESP32-S3", ms->radio_config);
+
+    EspRadioBoardConfig radio_cfg;
+    esp_radio_board_config_init(&radio_cfg);
+    if (ms->radio_config) {
+        Error *err = NULL;
+        if (!esp_radio_board_config_load(ms->radio_config, &radio_cfg, &err)) {
+            error_report_err(err);
+            exit(1);
+        }
+        qemu_log("ESP32-S3 radio board: type=%s chips=%d nss=%d busy=%d "
+                 "dio1=%d miso=%d mosi=%d sck=%d\n",
+                 esp_radio_type_str(radio_cfg.type),
+                 radio_cfg.chip_count,
+                 radio_cfg.chips[0].nss,
+                 radio_cfg.chips[0].busy,
+                 radio_cfg.chips[0].dio1,
+                 radio_cfg.miso, radio_cfg.mosi, radio_cfg.sck);
+    }
+
     object_initialize_child(OBJECT(ms), "soc", &ms->esp32s3, TYPE_ESP32S3_SOC);
     Esp32s3SocState *ss = ESP32S3_SOC(&ms->esp32s3);
 
@@ -974,6 +998,8 @@ static ram_addr_t esp32s3_fixup_ram_size(ram_addr_t requested_size)
     return size;
 }
 
+ESP_RADIO_OPTIONS_DEFINE_ACCESSORS(esp32s3_machine, Esp32s3MachineState, ESP32S3_MACHINE)
+
 /* Initialize machine type */
 static void esp32s3_machine_class_init(ObjectClass *oc, void *data)
 {
@@ -984,6 +1010,8 @@ static void esp32s3_machine_class_init(ObjectClass *oc, void *data)
     mc->default_cpus = 2;
     mc->default_ram_size = 0;
     mc->fixup_ram_size = esp32s3_fixup_ram_size;
+
+    ESP_RADIO_OPTIONS_ADD_PROPS(oc, esp32s3_machine);
 }
 
 static const TypeInfo esp32s3_info = {

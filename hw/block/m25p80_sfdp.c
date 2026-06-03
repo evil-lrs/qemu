@@ -440,6 +440,19 @@ static const uint8_t sfdp_w25q80bl[] = {
 };
 define_sfdp_read(w25q80bl);
 
+uint8_t m25p80_sfdp_gd25q32(uint32_t addr)
+{
+    /*
+     * GD25Q32 is close enough to the small Winbond table for ESP-IDF flash
+     * probing. Override only the density DWORD: 32 Mbit - 1.
+     */
+    static const uint8_t density[] = { 0xff, 0xff, 0xff, 0x01 };
+    if (addr >= 0x84 && addr < 0x88) {
+        return density[addr - 0x84];
+    }
+    return sfdp_w25q80bl[addr & (sizeof(sfdp_w25q80bl) - 1)];
+}
+
 /*
  * Integrated Silicon Solution (ISSI)
  */

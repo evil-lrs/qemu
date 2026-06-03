@@ -207,7 +207,8 @@ static const FlashPartInfo known_devices[] = {
     { INFO("en25q64",     0x1c3017,      0,  64 << 10, 128, ER_4K) },
 
     /* GigaDevice */
-    { INFO("gd25q32",     0xc84016,      0,  64 << 10,  64, ER_4K) },
+    { INFO("gd25q32",     0xc84016,      0,  64 << 10,  64, ER_4K),
+      .sfdp_read = m25p80_sfdp_gd25q32 },
     { INFO("gd25q64",     0xc84017,      0,  64 << 10, 128, ER_4K) },
 
     /* Intel/Numonyx -- xxxs33b */
@@ -437,6 +438,8 @@ typedef enum {
      * Winbond: 0x31 - write status register 2
      */
     WRSR2 = 0x31,
+    ERASE_PROGRAM_SUSPEND = 0x75,
+    ERASE_PROGRAM_RESUME = 0x7a,
 
     RNVCR = 0xB5,
     WNVCR = 0xB1,
@@ -835,6 +838,7 @@ static void complete_collecting_data(Flash *s)
     case WRSR2:
         switch (get_man(s)) {
         case MAN_WINBOND:
+        case MAN_GIGADEVICE:
             s->quad_enable = !!(s->data[0] & 0x02);
             break;
         default:
@@ -856,27 +860,21 @@ static void complete_collecting_data(Flash *s)
         break;
     case RDID_90:
     case RDID_AB:
-        if (get_man(s) == MAN_SST) {
-            if (s->cur_addr <= 1) {
-                if (s->cur_addr) {
-                    s->data[0] = s->pi->id[2];
-                    s->data[1] = s->pi->id[0];
-                } else {
-                    s->data[0] = s->pi->id[0];
-                    s->data[1] = s->pi->id[2];
-                }
-                s->pos = 0;
-                s->len = 2;
-                s->data_read_loop = true;
-                s->state = STATE_READING_DATA;
+        if (s->cur_addr <= 1) {
+            if (s->cur_addr) {
+                s->data[0] = s->pi->id[2];
+                s->data[1] = s->pi->id[0];
             } else {
-                qemu_log_mask(LOG_GUEST_ERROR,
-                              "M25P80: Invalid read id address\n");
+                s->data[0] = s->pi->id[0];
+                s->data[1] = s->pi->id[2];
             }
+            s->pos = 0;
+            s->len = 2;
+            s->data_read_loop = true;
+            s->state = STATE_READING_DATA;
         } else {
             qemu_log_mask(LOG_GUEST_ERROR,
-                          "M25P80: Read id (command 0x90/0xAB) is not supported"
-                          " by device\n");
+                          "M25P80: Invalid read id address\n");
         }
         break;
 
@@ -1103,9 +1101,11 @@ static void decode_qio_read_cmd(Flash *s)
     /* Dummy cycles modeled with bytes writes instead of bits */
     switch (get_man(s)) {
     case MAN_WINBOND:
-    case MAN_GIGADEVICE:
         s->needed_bytes += WINBOND_CONTINUOUS_READ_MODE_CMD_LEN;
         s->needed_bytes += 4;
+        break;
+    case MAN_GIGADEVICE:
+        s->needed_bytes += GIGADEVICE_CONTINUOUS_READ_MODE_CMD_LEN;
         break;
     case MAN_SPANSION:
         s->needed_bytes += SPANSION_CONTINUOUS_READ_MODE_CMD_LEN;
@@ -1321,6 +1321,7 @@ static void decode_new_cmd(Flash *s, uint32_t value)
 
         switch (get_man(s)) {
         case MAN_WINBOND:
+        case MAN_GIGADEVICE:
             s->needed_bytes = 1;
             s->state = STATE_COLLECTING_DATA;
             s->pos = 0;
@@ -1414,6 +1415,8 @@ static void decode_new_cmd(Flash *s, uint32_t value)
         }
         break;
     case NOP:
+    case ERASE_PROGRAM_SUSPEND:
+    case ERASE_PROGRAM_RESUME:
         break;
     case EN_4BYTE_ADDR:
         s->four_bytes_address_mode = true;
@@ -1500,6 +1503,7 @@ static void decode_new_cmd(Flash *s, uint32_t value)
             s->quad_enable = true;
             break;
         case MAN_WINBOND:
+        case MAN_GIGADEVICE:
             s->data[0] = (!!s->quad_enable) << 1;
             s->pos = 0;
             s->len = 1;

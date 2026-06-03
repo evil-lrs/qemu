@@ -96,6 +96,8 @@ typedef struct ESPUARTState {
     uint32_t reg[UART_REG_CNT];
     MemoryRegionOps uart_ops;
 
+    FILE *raw_log;
+
     /* Protected: fields can be modified by the child class  */
     bool rx_tout_ena;
     /* Threshold, in bits, before triggering an RX timeout interrupt  */

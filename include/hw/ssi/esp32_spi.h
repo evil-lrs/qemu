@@ -16,9 +16,13 @@ typedef struct Esp32SpiState {
     MemoryRegion iomem;
     qemu_irq irq;
     qemu_irq cs_gpio[ESP32_SPI_CS_COUNT];
+    bool external_cs_valid[ESP32_SPI_CS_COUNT];
+    int external_cs_level[ESP32_SPI_CS_COUNT];
     int num_cs;
+    int id;
     SSIBus *spi;
 
+    uint32_t cmd_reg;
     uint32_t addr_reg;
     uint32_t ctrl_reg;
     uint32_t status_reg;
@@ -91,4 +95,4 @@ REG32(SPI_EXT1, 0xF4)
 REG32(SPI_EXT2, 0xF8)
 REG32(SPI_EXT3, 0xFC)
 
-
+#define ESP32_SPI_EXTERNAL_CS_GPIO "external-cs"

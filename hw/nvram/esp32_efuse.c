@@ -275,6 +275,24 @@ static void esp32_efuse_init(Object *obj)
 
     memset(&s->efuse_rd, 0, sizeof(s->efuse_rd));
     memset(&s->efuse_wr, 0, sizeof(s->efuse_wr));
+
+    /* Default factory MAC matches the `cal_mac` stored in the
+     * dump_from_real_esp32.bin donor NVS so that PHY init's
+     * `load_cal_data_from_nvs_handle` accepts the pre-baked
+     * cal_data and does partial (fast) calibration instead of the
+     * multi-second full calibration sweep that exceeds QEMU's
+     * virtual-time budget.  See esp_phy/src/phy_init.c:685 for the
+     * MAC-equality check that gates partial vs full cal.
+     *
+     * MAC = EC:64:C9:9B:54:0C (real Espressif OUI), CRC8 = 0xF6.
+     * eFuse BLK0 layout (esp_efuse_table.csv):
+     *   bits 32..39 = byte 5, 40..47 = byte 4,
+     *   bits 48..55 = byte 3, 56..63 = byte 2  (BLK0 word 1)
+     *   bits 64..71 = byte 1, 72..79 = byte 0,
+     *   bits 80..87 = MAC CRC8                  (BLK0 word 2)
+     */
+    s->efuse_rd.blk0[1] = 0xC99B540Cu;
+    s->efuse_rd.blk0[2] = (s->efuse_rd.blk0[2] & 0xFF000000u) | 0x00F6EC64u;
 }
 
 static Property esp32_efuse_properties[] = {

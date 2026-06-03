@@ -25,10 +25,16 @@
 #include "hw/char/esp32_uart.h"
 #include "trace.h"
 
+#define UART_CONF0_RXFIFO_RST BIT(17)
+#define UART_CONF0_TXFIFO_RST BIT(18)
 
 static gboolean uart_transmit(void *do_not_use, GIOCondition cond, void *opaque);
 static void uart_receive(void *opaque, const uint8_t *buf, int size);
 
+static bool esp32_uart_tx_idle(ESP32UARTState *s)
+{
+    return fifo8_num_used(&s->tx_fifo) == 0 && s->tx_watch_handle == 0;
+}
 
 void esp32_uart_update_irq(ESP32UARTState *s)
 {
@@ -36,7 +42,7 @@ void esp32_uart_update_irq(ESP32UARTState *s)
 
     uint32_t tx_empty_raw = (fifo8_num_used(&s->tx_fifo) <= s->tx_empty_threshold);
     uint32_t rx_full_raw = (fifo8_num_used(&s->rx_fifo) >= s->rx_full_threshold);
-    uint32_t tx_done_raw = (fifo8_num_used(&s->tx_fifo) == 0);
+    uint32_t tx_done_raw = esp32_uart_tx_idle(s);
     uint32_t rxfifo_tout_raw = (s->rxfifo_tout) ? 1 : 0;
 
     uint32_t int_raw = s->reg[R_UART_INT_RAW];
@@ -85,15 +91,36 @@ static uint64_t uart_read(void *opaque, hwaddr addr, unsigned int size)
             error_report("esp_uart: read UART FIFO while it is empty");
         } else {
             r = fifo8_pop(&s->rx_fifo);
+            if (getenv("QEMU_ESP32_ELRS_TRACE")) {
+                qemu_log("esp32_uart[%s]: read FIFO value=0x%02x used=%u\n",
+                         object_get_canonical_path_component(OBJECT(s)),
+                         (unsigned)r,
+                         fifo8_num_used(&s->rx_fifo));
+            }
             esp32_uart_update_irq(s);
             qemu_chr_fe_accept_input(&s->chr);
         }
         break;
 
-    case A_UART_STATUS:
+    case A_UART_STATUS: {
+        if (fifo8_num_used(&s->tx_fifo) > 0) {
+            uart_transmit(NULL, G_IO_OUT, s);
+        }
+        uint32_t tx_state = esp32_uart_tx_idle(s) ? 0 : 1;
         r = FIELD_DP32(r, UART_STATUS, RXFIFO_CNT, fifo8_num_used(&s->rx_fifo));
         r = FIELD_DP32(r, UART_STATUS, TXFIFO_CNT, fifo8_num_used(&s->tx_fifo));
+        r = FIELD_DP32(r, UART_STATUS, ST_UTX_OUT, tx_state);
+        if (getenv("QEMU_ESP32_ELRS_TRACE")) {
+            qemu_log("esp32_uart[%s]: read STATUS=0x%08x rx=%u tx=%u int_ena=0x%08x int_st=0x%08x\n",
+                     object_get_canonical_path_component(OBJECT(s)),
+                     (unsigned)r,
+                     fifo8_num_used(&s->rx_fifo),
+                     fifo8_num_used(&s->tx_fifo),
+                     s->reg[R_UART_INT_ENA],
+                     s->reg[R_UART_INT_ST]);
+        }
         break;
+    }
 
     case A_UART_LOWPULSE:
     case A_UART_HIGHPULSE:
@@ -135,7 +162,15 @@ static void uart_write(void *opaque, hwaddr addr,
         if (fifo8_num_free(&s->tx_fifo) == 0) {
             error_report("esp_uart: write to UART FIFO while it is full");
         } else {
-            fifo8_push(&s->tx_fifo, (uint8_t) (value & 0xff));
+            uint8_t ch = (uint8_t) (value & 0xff);
+            if (s->raw_log) {
+                fputc(ch, s->raw_log);
+                fflush(s->raw_log);
+            }
+            if (getenv("QEMU_ESP32_ELRS_TRACE")) {
+                qemu_log("esp32_uart: write to FIFO: 0x%02x '%c'\n", ch, isprint(ch) ? ch : '.');
+            }
+            fifo8_push(&s->tx_fifo, ch);
             uart_transmit(NULL, G_IO_OUT, s);
         }
         break;
@@ -150,6 +185,29 @@ static void uart_write(void *opaque, hwaddr addr,
 
     case A_UART_INT_ENA:
         s->reg[addr / 4] = value;
+        if (getenv("QEMU_ESP32_ELRS_TRACE")) {
+            qemu_log("esp32_uart[%s]: write INT_ENA=0x%08x raw=0x%08x st=0x%08x rx=%u\n",
+                     object_get_canonical_path_component(OBJECT(s)),
+                     (unsigned)value,
+                     s->reg[R_UART_INT_RAW],
+                     s->reg[R_UART_INT_ST],
+                     fifo8_num_used(&s->rx_fifo));
+        }
+        break;
+
+    case A_UART_CONF0:
+        if (value & UART_CONF0_TXFIFO_RST) {
+            fifo8_reset(&s->tx_fifo);
+            if (s->tx_watch_handle) {
+                g_source_remove(s->tx_watch_handle);
+                s->tx_watch_handle = 0;
+            }
+        }
+        if (value & UART_CONF0_RXFIFO_RST) {
+            fifo8_reset(&s->rx_fifo);
+        }
+        s->reg[addr / 4] =
+            value & ~(UART_CONF0_TXFIFO_RST | UART_CONF0_RXFIFO_RST);
         break;
 
     case A_UART_CLKDIV: {
@@ -193,6 +251,16 @@ static void uart_write(void *opaque, hwaddr addr,
          */
         s->rx_tout_thres = 8 * FIELD_EX32(s->reg[R_UART_CONF1], UART_CONF1, TOUT_THRD);
         s->rx_tout_ena = FIELD_EX32(s->reg[R_UART_CONF1], UART_CONF1, TOUT_EN) != 0;
+        if (getenv("QEMU_ESP32_ELRS_TRACE")) {
+            qemu_log("esp32_uart[%s]: write CONF1=0x%08x rx_thr=%u tx_thr=%u tout_ena=%d tout_bits=%u rx=%u\n",
+                     object_get_canonical_path_component(OBJECT(s)),
+                     (unsigned)value,
+                     s->rx_full_threshold,
+                     s->tx_empty_threshold,
+                     s->rx_tout_ena,
+                     s->rx_tout_thres,
+                     fifo8_num_used(&s->rx_fifo));
+        }
         esp32_uart_set_rx_timeout(s);
         esp32_uart_update_irq(s);
         break;
@@ -245,6 +313,15 @@ static void uart_receive(void *opaque, const uint8_t *buf, int size)
 
     if (size == 0) {
         return;
+    }
+
+    if (getenv("QEMU_ESP32_ELRS_TRACE")) {
+        const char *name = object_get_canonical_path_component(OBJECT(s));
+        qemu_log("esp32_uart[%s]: receive size=%d first=0x%02x free=%u\n",
+                 name ? name : "?",
+                 size,
+                 buf[0],
+                 fifo8_num_free(&s->rx_fifo));
     }
 
     /* If we can receive anything: cancel any pending RX timeout timer,
@@ -344,6 +421,16 @@ static void esp32_uart_realize(DeviceState *dev, Error **errp)
 
     qemu_chr_fe_set_handlers(&s->chr, uart_can_receive, uart_receive,
                              uart_event, NULL, s, NULL, true);
+
+    const char *name = object_get_canonical_path_component(OBJECT(dev));
+    if (name) {
+        char *filename = g_strdup_printf("%s.log", name);
+        s->raw_log = fopen(filename, "w");
+        if (s->raw_log) {
+            setvbuf(s->raw_log, NULL, _IONBF, 0);
+        }
+        g_free(filename);
+    }
 }
 
 

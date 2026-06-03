@@ -24,6 +24,21 @@
 #define SPI1_DEBUG      0
 #define SPI1_WARNING    0
 
+#define GPSPI_CMD        0x000
+#define GPSPI_ADDR       0x004
+#define GPSPI_CTRL       0x008
+#define GPSPI_CLOCK      0x00c
+#define GPSPI_USER       0x010
+#define GPSPI_USER1      0x014
+#define GPSPI_USER2      0x018
+#define GPSPI_MS_DLEN    0x01c
+#define GPSPI_MISC       0x020
+#define GPSPI_W0         0x098
+#define GPSPI_W15        0x0d4
+
+#define GPSPI_CMD_UPDATE BIT(23)
+#define GPSPI_CMD_USR    BIT(24)
+
 
 enum {
     CMD_RES = 0xab,
@@ -62,6 +77,33 @@ static uint64_t esp32c3_spi_read(void *opaque, hwaddr addr, unsigned int size)
     ESP32C3SpiState *s = ESP32C3_SPI(opaque);
 
     uint64_t r = 0;
+    if (s->id == 2) {
+        switch (addr) {
+        case GPSPI_CMD:
+            return 0;
+        case GPSPI_ADDR:
+            return s->mem_addr;
+        case GPSPI_CTRL:
+            return s->mem_ctrl;
+        case GPSPI_CLOCK:
+            return s->mem_clock;
+        case GPSPI_USER:
+            return s->mem_user;
+        case GPSPI_USER1:
+            return s->mem_user1;
+        case GPSPI_USER2:
+            return s->mem_user2;
+        case GPSPI_MS_DLEN:
+            return s->mem_ms_dlen;
+        case GPSPI_MISC:
+            return s->mem_misc;
+        case GPSPI_W0 ... GPSPI_W15:
+            return s->data_reg[(addr - GPSPI_W0) / sizeof(uint32_t)];
+        default:
+            break;
+        }
+    }
+
     switch (addr) {
         case A_SPI_MEM_CMD:
             r = 0;
@@ -127,11 +169,11 @@ static void esp32c3_spi_txrx_buffer(ESP32C3SpiState *s,
     int bytes = MAX(tx_bytes, rx_bytes);
     for (int i = 0; i < bytes; ++i) {
         uint8_t byte = 0;
-        if (byte < tx_bytes) {
+        if (i < tx_bytes) {
             memcpy(&byte, tx + i, 1);
         }
         uint32_t res = ssi_transfer(s->spi, byte);
-        if (byte < rx_bytes) {
+        if (i < rx_bytes) {
             memcpy(rx + i, &res, 1);
         }
     }
@@ -140,6 +182,58 @@ static void esp32c3_spi_txrx_buffer(ESP32C3SpiState *s,
 static void esp32c3_spi_dummy_cycles(ESP32C3SpiState *s, uint32_t dummy_bytes) {
     for (int i = 0; i < dummy_bytes; i++) {
         ssi_transfer(s->spi, 0);
+    }
+}
+
+static bool esp32c3_spi_trace_enabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0) {
+        enabled = g_getenv("QEMU_ESP32C3_SPI_TRACE") ? 1 : 0;
+    }
+
+    return enabled;
+}
+
+static void esp32c3_spi_trace_transaction(const ESP32C3SpiTransaction *t)
+{
+    if (!esp32c3_spi_trace_enabled()) {
+        return;
+    }
+
+    fprintf(stderr,
+            "ESP32C3_SPI: cmd=0x%02x cmd_bytes=%u addr=0x%08x "
+            "addr_bytes=%u dummy_bytes=%u tx_bytes=%u rx_bytes=%u\n",
+            (uint8_t)t->cmd, t->cmd_bytes, t->addr, t->addr_bytes,
+            t->dummy_bytes, t->tx_bytes, t->rx_bytes);
+}
+
+static bool esp32c3_spi_external_cs_active(ESP32C3SpiState *s)
+{
+    for (int i = 0; i < ESP32C3_SPI_CS_COUNT; i++) {
+        if (s->external_cs_valid[i] && s->external_cs_level[i] == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void esp32c3_spi_external_cs(void *opaque, int n, int level)
+{
+    ESP32C3SpiState *s = ESP32C3_SPI(opaque);
+
+    if (n < 0 || n >= ESP32C3_SPI_CS_COUNT) {
+        return;
+    }
+
+    s->external_cs_valid[n] = true;
+    s->external_cs_level[n] = level ? 1 : 0;
+    qemu_set_irq(s->cs_gpio[n], s->external_cs_level[n]);
+
+    if (esp32c3_spi_trace_enabled()) {
+        fprintf(stderr, "ESP32C3_SPI%d: external-cs[%d]=%d\n",
+                s->id, n, s->external_cs_level[n]);
     }
 }
 
@@ -154,12 +248,18 @@ static void esp32c3_spi_perform_transaction(ESP32C3SpiState *s, ESP32C3SpiTransa
             xts_aes_class->read_ciphertext(s->xts_aes, t->data, &(t->tx_bytes), &(t->addr), &(t->addr_bytes));
         }
     }
-    qemu_set_irq(s->cs_gpio[0], 0);
+    esp32c3_spi_trace_transaction(t);
+    bool external_cs_active = esp32c3_spi_external_cs_active(s);
+    if (!external_cs_active) {
+        qemu_set_irq(s->cs_gpio[0], 0);
+    }
     esp32c3_spi_txrx_buffer(s, &t->cmd, t->cmd_bytes, NULL, 0);
     esp32c3_spi_txrx_buffer(s, &t->addr, t->addr_bytes, NULL, 0);
     esp32c3_spi_dummy_cycles(s, t->dummy_bytes);
     esp32c3_spi_txrx_buffer(s, t->data, t->tx_bytes, t->data, t->rx_bytes);
-    qemu_set_irq(s->cs_gpio[0], 1);
+    if (!external_cs_active) {
+        qemu_set_irq(s->cs_gpio[0], 1);
+    }
 }
 
 
@@ -196,24 +296,34 @@ static void esp32c3_spi_begin_transaction(ESP32C3SpiState *s)
         .data = s->data_reg
      };
 
+    const bool gpspi = s->id == 2;
+
     /* Get the number of bytes to read from the device */
     if (s->mem_user & R_SPI_MEM_USER_USR_MISO_MASK) {
         t.rx_bytes = FIELD_EX32(s->mem_miso_len, SPI_MEM_MISO_DLEN, USR_MISO_DBITLEN);
+        if (gpspi && s->mem_ms_dlen) {
+            t.rx_bytes = s->mem_ms_dlen & 0x3ffff;
+        }
         t.rx_bytes = (t.rx_bytes + 1) / 8;
     }
 
     /* and the number of bytes to write to the device */
     if (s->mem_user & R_SPI_MEM_USER_USR_MOSI_MASK) {
         t.tx_bytes = FIELD_EX32(s->mem_mosi_len, SPI_MEM_MOSI_DLEN, USR_MOSI_DBITLEN);
+        if (gpspi && s->mem_ms_dlen) {
+            t.tx_bytes = s->mem_ms_dlen & 0x3ffff;
+        }
         t.tx_bytes = (t.tx_bytes + 1) / 8;
     }
 
     /* Get the command and its length, in bytes
      * In theory we should test mem_user's command bit. In practice, if we do, `esptool`
      * cannot write flash successfully and detects an error */
-    t.cmd = FIELD_EX32(s->mem_user2, SPI_MEM_USER2, USR_COMMAND_VALUE);
-    t.cmd_bytes = FIELD_EX32(s->mem_user2, SPI_MEM_USER2, USR_COMMAND_BITLEN);
-    t.cmd_bytes = (t.cmd_bytes + 1) / 8;
+    if (!gpspi || (s->mem_user & R_SPI_MEM_USER_USR_COMMAND_MASK)) {
+        t.cmd = FIELD_EX32(s->mem_user2, SPI_MEM_USER2, USR_COMMAND_VALUE);
+        t.cmd_bytes = FIELD_EX32(s->mem_user2, SPI_MEM_USER2, USR_COMMAND_BITLEN);
+        t.cmd_bytes = (t.cmd_bytes + 1) / 8;
+    }
 
     /* Get the address and its length, in bytes */
     if (s->mem_user & R_SPI_MEM_USER_USR_ADDR_MASK) {
@@ -343,10 +453,55 @@ static void esp32c3_spi_write(void *opaque, hwaddr addr,
     info_report("[SPI1] Writing 0x%lx = %08lx", addr, value);
 #endif
 
+    if (s->id == 2) {
+        switch (addr) {
+        case GPSPI_CMD:
+            if (wvalue & GPSPI_CMD_UPDATE) {
+                s->mem_cmd = wvalue & ~GPSPI_CMD_UPDATE;
+            } else if (wvalue & GPSPI_CMD_USR) {
+                esp32c3_spi_begin_transaction(s);
+                s->mem_cmd = wvalue & ~GPSPI_CMD_USR;
+            } else {
+                s->mem_cmd = wvalue;
+            }
+            return;
+        case GPSPI_ADDR:
+            s->mem_addr = wvalue;
+            return;
+        case GPSPI_CTRL:
+            s->mem_ctrl = wvalue;
+            return;
+        case GPSPI_CLOCK:
+            s->mem_clock = wvalue;
+            return;
+        case GPSPI_USER:
+            s->mem_user = wvalue;
+            return;
+        case GPSPI_USER1:
+            s->mem_user1 = wvalue;
+            return;
+        case GPSPI_USER2:
+            s->mem_user2 = wvalue;
+            return;
+        case GPSPI_MS_DLEN:
+            s->mem_ms_dlen = wvalue;
+            return;
+        case GPSPI_MISC:
+            s->mem_misc = wvalue;
+            return;
+        case GPSPI_W0 ... GPSPI_W15:
+            s->data_reg[(addr - GPSPI_W0) / sizeof(uint32_t)] = wvalue;
+            return;
+        default:
+            break;
+        }
+    }
+
     switch (addr) {
         case A_SPI_MEM_CMD:
             if(wvalue & R_SPI_MEM_CMD_USR_MASK) {
                 esp32c3_spi_begin_transaction(s);
+                s->mem_cmd = wvalue & ~R_SPI_MEM_CMD_USR_MASK;
             } else {
                 esp32c3_spi_special_command(s, wvalue);
             }
@@ -410,6 +565,11 @@ static void esp32c3_spi_reset_hold(Object *obj, ResetType type)
 {
     ESP32C3SpiState *s = ESP32C3_SPI(obj);
     memset(s->data_reg, 0, ESP32C3_SPI_BUF_WORDS * sizeof(uint32_t));
+    memset(s->external_cs_valid, 0, sizeof(s->external_cs_valid));
+    for (int i = 0; i < ESP32C3_SPI_CS_COUNT; i++) {
+        s->external_cs_level[i] = 1;
+        qemu_set_irq(s->cs_gpio[i], 1);
+    }
     s->mem_ctrl1 = FIELD_DP32(s->mem_ctrl1, SPI_MEM_CTRL1, CS_HOLD_DLY_RES, 0x3ff);
     s->mem_clock = FIELD_DP32(s->mem_clock, SPI_MEM_CLOCK, CLKCNT_N, 3);
     s->mem_clock = FIELD_DP32(s->mem_clock, SPI_MEM_CLOCK, CLKCNT_H, 1);
@@ -447,13 +607,17 @@ static void esp32c3_spi_init(Object *obj)
     sysbus_init_mmio(sbd, &s->iomem);
     // sysbus_init_irq(sbd, &s->irq);
 
-    esp32c3_spi_reset_hold(obj, RESET_TYPE_COLD);
-
     s->spi = ssi_create_bus(DEVICE(s), "spi");
     qdev_init_gpio_out_named(DEVICE(s), &s->cs_gpio[0], SSI_GPIO_CS, ESP32C3_SPI_CS_COUNT);
+    qdev_init_gpio_in_named(DEVICE(s), esp32c3_spi_external_cs,
+                            ESP32C3_SPI_EXTERNAL_CS_GPIO,
+                            ESP32C3_SPI_CS_COUNT);
+
+    esp32c3_spi_reset_hold(obj, RESET_TYPE_COLD);
 }
 
 static Property esp32c3_spi_properties[] = {
+    DEFINE_PROP_UINT8("id", ESP32C3SpiState, id, 1),
     DEFINE_PROP_END_OF_LIST(),
 };
 

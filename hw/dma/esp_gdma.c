@@ -277,8 +277,8 @@ bool esp_gdma_get_channel_periph(ESPGdmaState *s, GdmaPeripheral periph, int dir
     for (int i = 0; i < class->m_channel_count; i++) {
         /* IN/OUT PERI registers have the same organization, can use any macro.
          * Look for the channel that was configured with the given peripheral. It must be marked as "started" too */
-        if ( FIELD_EX32(s->ch_conf[dir][i].peripheral, GDMA_PERI_SEL, PERI_SEL) == periph ||
-             FIELD_EX32(s->ch_conf[dir][i].link, GDMA_OUT_LINK, START)) {
+        if (FIELD_EX32(s->ch_conf[dir][i].peripheral, GDMA_PERI_SEL, PERI_SEL) == periph &&
+            FIELD_EX32(s->ch_conf[dir][i].link, GDMA_OUT_LINK, START)) {
 
             *chan = i;
             return true;
@@ -330,6 +330,11 @@ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint
         return false;
     }
 
+    if (out_list.config.length == 0 || out_list.buf_addr == 0) {
+        esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_OUT_DSCR_ERR_MASK);
+        return false;
+    }
+
     /* Store the current number of bytes written to `buffer` parameter */
     uint32_t consumed = 0;
     bool exit_loop = false;
@@ -368,10 +373,23 @@ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint
 
             /* Retrieve the next node  while updating the virtual guest address */
             out_addr = out_list.next_addr;
+            if (out_addr == 0) {
+                if (exit_loop || eof_bit) {
+                    if (eof_bit) {
+                        esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_OUT_EOF_MASK |
+                                                           R_GDMA_INTERRUPT_OUT_TOTAL_EOF_MASK);
+                    }
+                    break;
+                }
+                esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_OUT_DSCR_ERR_MASK);
+                error = true;
+                break;
+            }
             valid = esp_gdma_next_list_node(s, chan, ESP_GDMA_OUT_IDX, &out_list);
 
             /* Only check the valid flag and the owner if we don't have to exit the loop*/
-            if ( !exit_loop && (!valid || (owner_check_out && !out_list.config.owner)) ) {
+            if ( !exit_loop && (!valid || (owner_check_out && !out_list.config.owner) ||
+                                out_list.config.length == 0 || out_list.buf_addr == 0) ) {
                 esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_OUT_DSCR_ERR_MASK);
                 error = true;
             }
@@ -761,6 +779,75 @@ static void esp_gdma_check_and_start_mem_transfer(ESPGdmaState *s, uint32_t chan
     }
 }
 
+static bool esp_gdma_should_complete_out_periph(DmaConfigState *s)
+{
+    const GdmaPeripheral periph =
+        FIELD_EX32(s->peripheral, GDMA_PERI_SEL, PERI_SEL);
+
+    return periph == GDMA_I2S0 || periph == GDMA_I2S1;
+}
+
+static void esp_gdma_complete_out_periph_transfer(ESPGdmaState *s, uint32_t chan,
+                                                  bool restart)
+{
+    DmaConfigState *state = &s->ch_conf[ESP_GDMA_OUT_IDX][chan];
+    uint32_t addr = 0;
+
+    state->link &= R_GDMA_OUT_LINK_ADDR_MASK;
+    esp_gdma_clear_status(&state->int_state,
+                          R_GDMA_INTERRUPT_OUT_DONE_MASK |
+                          R_GDMA_INTERRUPT_OUT_EOF_MASK |
+                          R_GDMA_INTERRUPT_OUT_TOTAL_EOF_MASK);
+
+    if (restart) {
+        esp_gdma_get_restart_buffer(s, chan, ESP_GDMA_OUT_IDX, &addr);
+    } else {
+        addr = ((ESP_GDMA_RAM_ADDR >> 20) << 20) |
+            FIELD_EX32(state->link, GDMA_OUT_LINK, ADDR);
+    }
+
+    if (addr != 0) {
+        const bool clear_owner =
+            FIELD_EX32(state->conf0, GDMA_OUT_CONF0, AUTO_WRBACK);
+
+        for (unsigned i = 0; i < 128; i++) {
+            GdmaLinkedList out_list = { 0 };
+            const uint32_t current = addr;
+            bool valid = true;
+
+            valid = esp_gdma_read_descr(s, current, &out_list);
+            if (!valid) {
+                esp_gdma_set_status(&state->int_state,
+                                    R_GDMA_INTERRUPT_OUT_DSCR_ERR_MASK);
+                return;
+            }
+
+            esp_gdma_push_descriptor(s, chan, ESP_GDMA_OUT_IDX, current);
+            if (clear_owner) {
+                out_list.config.owner = 0;
+                valid = esp_gdma_write_descr(s, current, &out_list);
+                if (!valid) {
+                    esp_gdma_set_status(&state->int_state,
+                                        R_GDMA_INTERRUPT_OUT_DSCR_ERR_MASK);
+                    return;
+                }
+            }
+
+            if (out_list.config.suc_eof || out_list.next_addr == 0) {
+                state->suc_eof_desc_addr = current;
+                break;
+            }
+
+            addr = out_list.next_addr;
+        }
+    }
+
+    esp_gdma_set_status(&state->int_state,
+                        R_GDMA_INTERRUPT_OUT_DONE_MASK |
+                        R_GDMA_INTERRUPT_OUT_EOF_MASK |
+                        R_GDMA_INTERRUPT_OUT_TOTAL_EOF_MASK);
+}
+
 
 /**
  * @brief Function called when a writable configuration register is being written to.
@@ -811,7 +898,13 @@ static void esp_gdma_write_chan_conf(ESPGdmaState *state, uint32_t dir, uint32_t
             /* Check if any of the previous two bits has just been enabled */
             if ((value & start_mask) || (value & restart_mask))
             {
-                esp_gdma_check_and_start_mem_transfer(state, chan);
+                if (dir == ESP_GDMA_OUT_IDX &&
+                    esp_gdma_should_complete_out_periph(s)) {
+                    esp_gdma_complete_out_periph_transfer(
+                        state, chan, value & restart_mask);
+                } else {
+                    esp_gdma_check_and_start_mem_transfer(state, chan);
+                }
             }
             break;
 

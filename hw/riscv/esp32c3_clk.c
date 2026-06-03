@@ -83,6 +83,12 @@ static void esp32c3_clock_write(void *opaque, hwaddr addr, uint64_t value,
     ESP32C3ClockState *s = ESP32C3_CLOCK(opaque);
 
     switch(addr) {
+        case A_SYSTEM_CPU_PER_CONF:
+            s->cpuperconf = value;
+            break;
+        case A_SYSTEM_SYSCLK_CONF:
+            s->sysclk = value;
+            break;
         case A_SYSTEM_CPU_INTR_FROM_CPU_0:
         case A_SYSTEM_CPU_INTR_FROM_CPU_1:
         case A_SYSTEM_CPU_INTR_FROM_CPU_2:

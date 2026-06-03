@@ -20,11 +20,17 @@
 #include "hw/i2c/esp32_i2c.h"
 #include "hw/xtensa/xtensa_memory.h"
 #include "hw/misc/unimp.h"
+#include "hw/misc/esp_radio_config.h"
+#include "hw/misc/esp_radio_board.h"
+#include "hw/misc/esp32_wifi_stub.h"
 #include "hw/irq.h"
 #include "hw/i2c/i2c.h"
 #include "hw/qdev-properties.h"
 #include "hw/xtensa/esp32.h"
 #include "hw/misc/ssi_psram.h"
+#include "hw/ssi/sx127x.h"
+#include "hw/ssi/sx128x.h"
+#include "hw/ssi/lr1121.h"
 #include "hw/sd/dwc_sdmmc.h"
 #include "core-esp32/core-isa.h"
 #include "qemu/datadir.h"
@@ -35,6 +41,7 @@
 #include "sysemu/blockdev.h"
 #include "sysemu/block-backend.h"
 #include "exec/exec-all.h"
+#include "exec/tb-flush.h"
 #include "net/net.h"
 #include "elf.h"
 
@@ -100,6 +107,9 @@ static void esp32_dig_reset(void *opaque, int n, int level)
 {
     Esp32SocState *s = ESP32_SOC(opaque);
     if (level) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32: digital reset requested line=%d pc=0x%08" PRIx64 "\n",
+                      n, current_cpu ? current_cpu->mem_io_pc : 0);
         esp32_dport_clear_ill_trap_state(&s->dport);
         s->requested_reset = ESP32_SOC_RESET_DIG;
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
@@ -110,6 +120,9 @@ static void esp32_cpu_reset(void* opaque, int n, int level)
 {
     Esp32SocState *s = ESP32_SOC(opaque);
     if (level) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32: CPU%d reset requested pc=0x%08" PRIx64 "\n",
+                      n, current_cpu ? current_cpu->mem_io_pc : 0);
         s->requested_reset = (n == 0) ? ESP32_SOC_RESET_PROCPU : ESP32_SOC_RESET_APPCPU;
         /* Use different cause for APP CPU so that its reset doesn't cause QEMU to exit,
          * when -no-reboot option is given.
@@ -201,6 +214,12 @@ static void esp32_soc_reset(DeviceState *dev)
         xtensa_select_static_vectors(&s->cpu[1].env, s->rtc_cntl.stat_vector_sel[1]);
         remove_cpu_watchpoints(&s->cpu[1]);
         cpu_reset(CPU(&s->cpu[1]));
+        if (s->dport.appcpu_boot_addr) {
+            s->cpu[1].env.pc = s->dport.appcpu_boot_addr;
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP32: APP CPU boot pc=0x%08x\n",
+                          s->dport.appcpu_boot_addr);
+        }
     }
     s->requested_reset = 0;
 }
@@ -247,12 +266,18 @@ static void esp32_clk_update(void* opaque, int n, int level)
 
 static void esp32_soc_add_periph_device(MemoryRegion *dest, void* dev, hwaddr dport_base_addr)
 {
+    /* Priority 1: proper qdev devices (esp32_wifi, esp32_phya, esp32_fe,
+     * esp32_ana, esp32_iomux, esp32_sens, sdmmc, rgb, ...) must take
+     * precedence over the priority-0 wifi_stub catch-all regions
+     * (esp32.mcpwm at 0x3ff70000+0x8000 overlaps WiFi MAC,
+     * PHYA, WDEV, chipv7_phy; without higher priority the qdev
+     * devices were silently shadowed). */
     MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 0);
-    memory_region_add_subregion_overlap(dest, dport_base_addr, mr, 0);
+    memory_region_add_subregion_overlap(dest, dport_base_addr, mr, 1);
     MemoryRegion *mr_apb = g_new(MemoryRegion, 1);
     char *name = g_strdup_printf("mr-apb-0x%08x", (uint32_t) dport_base_addr);
     memory_region_init_alias(mr_apb, OBJECT(dev), name, mr, 0, memory_region_size(mr));
-    memory_region_add_subregion_overlap(dest, dport_base_addr - DR_REG_DPORT_APB_BASE + APB_REG_BASE, mr_apb, 0);
+    memory_region_add_subregion_overlap(dest, dport_base_addr - DR_REG_DPORT_APB_BASE + APB_REG_BASE, mr_apb, 1);
     g_free(name);
 }
 
@@ -348,7 +373,8 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     }
     qdev_realize(DEVICE(&s->intmatrix), &s->periph_bus, &error_fatal);
     DeviceState* intmatrix_dev = DEVICE(&s->intmatrix);
-    memory_region_add_subregion_overlap(dport_mem, ESP32_DPORT_PRO_INTMATRIX_BASE, sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->intmatrix), 0), -1);
+    memory_region_add_subregion_overlap(dport_mem, ESP32_DPORT_PRO_INTMATRIX_BASE,
+                                        sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->intmatrix), 0), -1);
 
     bool init_cache_err = false;
     if (s->dport.flash_blk) {
@@ -414,6 +440,8 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
 
     qdev_realize(DEVICE(&s->gpio), &s->periph_bus, &error_fatal);
     esp32_soc_add_periph_device(sys_mem, &s->gpio, DR_REG_GPIO_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio), 0,
+                       qdev_get_gpio_in(intmatrix_dev, ETS_GPIO_INTR_SOURCE));
 
     for (int i = 0; i < ESP32_UART_COUNT; ++i) {
         const hwaddr uart_base[] = {DR_REG_UART_BASE, DR_REG_UART1_BASE, DR_REG_UART2_BASE};
@@ -458,6 +486,7 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
         const hwaddr spi_base[] = {
             DR_REG_SPI0_BASE, DR_REG_SPI1_BASE, DR_REG_SPI2_BASE, DR_REG_SPI3_BASE
         };
+        qdev_prop_set_int32(DEVICE(&s->spi[i]), "id", i);
         qdev_realize(DEVICE(&s->spi[i]), &s->periph_bus, &error_fatal);
 
         esp32_soc_add_periph_device(sys_mem, &s->spi[i], spi_base[i]);
@@ -516,39 +545,98 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     esp32_soc_add_periph_device(sys_mem, &s->rgb, DR_REG_FRAMEBUF_BASE);
     memory_region_add_subregion_overlap(sys_mem, esp32_memmap[ESP32_MEMREGION_FRAMEBUF].base, &s->rgb.vram, 0);
 
-    esp32_soc_add_unimp_device(sys_mem, "esp32.analog", DR_REG_ANA_BASE, 0x1000);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.rtcio", DR_REG_RTCIO_BASE, 0x400);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.rtcio", DR_REG_SENS_BASE, 0x400);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.iomux", DR_REG_IO_MUX_BASE, 0x2000);
+    /* Wi-Fi MAC + PHY emulation: vendored from lcgamboa.  The MAC
+     * (esp32_wifi) needs a NIC backend; PHY-A (esp32_phya) and
+     * front-end (esp32_fe) are unconditional.  Surrounding regions
+     * (fe2/nrx/bb/chipv7_phy/chipv7_phyb) plus the remaining peripheral
+     * stubs (rtcio/apbctrl/i2s0/i2s1/rmt/pcnt/mcpwm) keep a plain
+     * stateful backing via esp32_wifi_stub.  IO_MUX and SENS are now
+     * modeled as real qdev devices (vendored from lcgamboa). */
+    qdev_realize(DEVICE(&s->fe), &s->periph_bus, &error_fatal);
+    esp32_soc_add_periph_device(sys_mem, &s->fe, DR_REG_FE_BASE);
+
+    qdev_realize(DEVICE(&s->phya), &s->periph_bus, &error_fatal);
+    esp32_soc_add_periph_device(sys_mem, &s->phya, DR_REG_PHYA_BASE);
+
+    qdev_realize(DEVICE(&s->ana), &s->periph_bus, &error_fatal);
+    esp32_soc_add_periph_device(sys_mem, &s->ana, DR_REG_ANA_BASE);
+
+    qdev_realize(DEVICE(&s->iomux), &s->periph_bus, &error_fatal);
+    esp32_soc_add_periph_device(sys_mem, &s->iomux, DR_REG_IO_MUX_BASE);
+
+    qdev_realize(DEVICE(&s->sens), &s->periph_bus, &error_fatal);
+    esp32_soc_add_periph_device(sys_mem, &s->sens, DR_REG_SENS_BASE);
+
+    NICInfo *wifi_nd = qemu_find_nic_info(TYPE_ESP32_WIFI, false, NULL);
+    if (wifi_nd != NULL) {
+        qdev_set_nic_properties(DEVICE(&s->wifi), wifi_nd);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(&s->wifi), &error_fatal);
+        esp32_soc_add_periph_device(sys_mem, &s->wifi, DR_REG_WIFI_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->wifi), 0,
+            qdev_get_gpio_in(intmatrix_dev, ETS_WIFI_MAC_INTR_SOURCE));
+    }
+
+#define ESP32_WIFI_STUB(name_, base_, size_, default_) \
+    esp32_wifi_stub_add_region((name_), (base_), \
+                               (base_) - DR_REG_DPORT_APB_BASE + APB_REG_BASE, \
+                               (size_), (default_))
+    ESP32_WIFI_STUB("esp32.rtcio",       DR_REG_RTCIO_BASE,   0x400,  0xffffffff);
+    /* esp32.sens and esp32.iomux are now real qdev devices vendored
+     * from lcgamboa (realized above near esp32_phya/ana). */
+    /* fe2/nrx/bb/chipv7_phy/chipv7_phyb mirror lcgamboa's
+     * create_unimplemented_device_default_value(-1) stubs. */
+    ESP32_WIFI_STUB("esp32.fe2",         DR_REG_FE2_BASE,     0x1000, 0xffffffff);
+    /* Previously a wifi_stub overlay called "esp32.nrx" was mapped
+     * at 0x3ff4e000 — but that is DR_REG_ANA_BASE, not NRX
+     * (DR_REG_NRX_BASE = 0x3ff5cc00, inside the BB region).  The
+     * overlay shadowed esp32_ana, including its offset-0xC4 channel
+     * write handler, which broke libphy's phy_dis_hw_set_freq()
+     * poll.  Real NRX is covered by the BB stub below. */
+    /* BB default 0: libphy's set_channel_rfpll_freq() reads
+     * BB[0x1008] and treats non-zero bits 29-31 as "calibration
+     * needed -> long path"; returning 0 takes the short path. */
+    ESP32_WIFI_STUB("esp32.bb",          0x3ff5c000,          0x2000, 0x00000000);
+    ESP32_WIFI_STUB("esp32.chipv7_phy",  0x3ff71000,          0x1000, 0xffffffff);
+    ESP32_WIFI_STUB("esp32.chipv7_phyb", DR_REG_WDEV_BASE,    0x1000, 0x00000000);
+    ESP32_WIFI_STUB("esp32.apbctrl",     DR_REG_APB_CTRL_BASE, 0x1000, 0x00000000);
+    /* libphy touches the BT controller's MMIO during PHY init
+     * because WiFi/BT share RF infrastructure on the real chip.
+     * Without coverage the access aborts with LoadStorePIFAddrError. */
+    ESP32_WIFI_STUB("esp32.bt",          DR_REG_BT_BASE,      0x1000, 0x00000000);
+#undef ESP32_WIFI_STUB
+
     esp32_soc_add_unimp_device(sys_mem, "esp32.hinf", DR_REG_HINF_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.slc", DR_REG_SLC_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.slchost", DR_REG_SLCHOST_BASE, 0x1000);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.apbctrl", DR_REG_APB_CTRL_BASE, 0x1000);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.i2s0", DR_REG_I2S_BASE, 0x1000);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.i2s1", DR_REG_I2S1_BASE, 0x1000);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.rmt", DR_REG_RMT_BASE, 0x1000);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.pcnt", DR_REG_PCNT_BASE, 0x1000);
+    /* i2s0/i2s1/rmt/pcnt/mcpwm participate in IDF clock/peripheral init
+     * (i2s0 is used by IDF as the PHY reference-clock source) and get
+     * polled for status bits the same way as the BB/FE regions.  Route
+     * them through the stateful wifi-stub so any "wait for ready"
+     * loops unblock without us enumerating each bit. */
+#define ESP32_I2S_STUB(name_, base_, source_) \
+    esp32_wifi_stub_add_i2s_region((name_), (base_), \
+                                   (base_) - DR_REG_DPORT_APB_BASE + APB_REG_BASE, \
+                                   0x1000, 0x00000000, \
+                                   qdev_get_gpio_in(intmatrix_dev, (source_)))
+    ESP32_I2S_STUB("esp32.i2s0",  DR_REG_I2S_BASE,  ETS_I2S0_INTR_SOURCE);
+    ESP32_I2S_STUB("esp32.i2s1",  DR_REG_I2S1_BASE, ETS_I2S1_INTR_SOURCE);
+#undef ESP32_I2S_STUB
+#define ESP32_WIFI_STUB(name_, base_, size_, default_) \
+    esp32_wifi_stub_add_region((name_), (base_), \
+                               (base_) - DR_REG_DPORT_APB_BASE + APB_REG_BASE, \
+                               (size_), (default_))
+    ESP32_WIFI_STUB("esp32.rmt",   DR_REG_RMT_BASE,  0x1000, 0xffffffff);
+    ESP32_WIFI_STUB("esp32.pcnt",  DR_REG_PCNT_BASE, 0x1000, 0xffffffff);
+    /* Keep mcpwm at 0x8000 — chipv7_phy/WIFI/PHYA/WDEV stubs and
+     * device are registered earlier and take precedence at the same
+     * subregion priority, so this catch-all doesn't actually shadow
+     * them.  Shrinking it broke IDF boot (regions in 0x3ff76xxx-
+     * 0x3ff77xxx then went unmapped). */
+    ESP32_WIFI_STUB("esp32.mcpwm", DR_REG_PWM3_BASE, 0x8000, 0xffffffff);
+#undef ESP32_WIFI_STUB
 
-    /* Emulation of a fake register used to mark that the chip is run via QEMU */
-    MemoryRegion *apbctrl_mem = g_new(MemoryRegion, 1);
-    memory_region_init_ram(apbctrl_mem, NULL, "esp32.apbctrl_date_reg", 8 /* bytes */, &error_fatal);
-
-    /* This register is not used in the real hardware (hardwired to 0), but is still accesible, reading
-     * it won't trigger an exception, so we can override it */
-    const hwaddr apb_ctrl_emu_reg = DR_REG_APB_CTRL_BASE + 0x78;
-    /* Store "QEMU" as a 32-bit value */
-    const uint32_t apb_ctrl_emu_val = 0x51454d55;
-    /* The memory region must be added before writing to the CPU memory */
-    memory_region_add_subregion(sys_mem, apb_ctrl_emu_reg, apbctrl_mem);
-    cpu_physical_memory_write(apb_ctrl_emu_reg, &apb_ctrl_emu_val, 4);
-
-    /* Emulation of APB_CTRL_DATE_REG, needed for ECO3 revision detection.
-     * This is a small hack to avoid creating a whole new device just to emulate one
-     * register.
-     */
-    const hwaddr apb_ctrl_date_reg = DR_REG_APB_CTRL_BASE + 0x7c;
-    uint32_t apb_ctrl_date_reg_val = 0x16042000 | 0x80000000;  /* MSB indicates ECO3 silicon revision */
-    cpu_physical_memory_write(apb_ctrl_date_reg, &apb_ctrl_date_reg_val, 4);
+    /* Catch-all for remaining peripheral space to avoid panics */
+    esp32_soc_add_unimp_device(sys_mem, "esp32.periph_ext", 0x3ff78000, 0x8000);
 
     qemu_register_reset((QEMUResetHandler*) esp32_soc_reset, dev);
 }
@@ -640,6 +728,15 @@ static void esp32_soc_init(Object *obj)
 
     object_initialize_child(obj, "efuse", &s->efuse, TYPE_ESP32_EFUSE);
 
+    if (qemu_find_nic_info(TYPE_ESP32_WIFI, false, NULL) != NULL) {
+        object_initialize_child(obj, "wifi", &s->wifi, TYPE_ESP32_WIFI);
+    }
+    object_initialize_child(obj, "fe", &s->fe, TYPE_ESP32_FE);
+    object_initialize_child(obj, "phya", &s->phya, TYPE_ESP32_PHYA);
+    object_initialize_child(obj, "ana", &s->ana, TYPE_ESP32_ANA);
+    object_initialize_child(obj, "iomux", &s->iomux, TYPE_ESP32_IOMUX);
+    object_initialize_child(obj, "sens", &s->sens, TYPE_ESP32_SENS);
+
     object_initialize_child(obj, "flash_enc", &s->flash_enc, TYPE_ESP32_FLASH_ENCRYPTION);
 
     object_initialize_child(obj, "sdmmc", &s->sdmmc, TYPE_DWC_SDMMC);
@@ -695,10 +792,246 @@ struct Esp32MachineState {
 
     Esp32SocState esp32;
     DeviceState *flash_dev;
+    char *radio_config;
+    char *radio_air_chardev;
+    char *phy_bypass_elf;
+    char *gpio_actions;
 };
 #define TYPE_ESP32_MACHINE MACHINE_TYPE_NAME("esp32")
 
 OBJECT_DECLARE_SIMPLE_TYPE(Esp32MachineState, ESP32_MACHINE)
+
+typedef struct Esp32GpioAction {
+    QEMUTimer *timer;
+    qemu_irq irq;
+    uint64_t at_ms;
+    unsigned pin;
+    int level;
+} Esp32GpioAction;
+
+typedef struct Esp32PhyBypassState {
+    bool enabled;
+    uint32_t patched_count;
+    uint32_t patch_count;
+    struct {
+        const char *symbol;
+        uint32_t addr;
+        uint32_t return_value;
+        bool repatchable;
+        bool patched;
+    } patches[24];
+    AddressSpace *as[ESP32_CPU_COUNT];
+} Esp32PhyBypassState;
+
+static Esp32PhyBypassState esp32_phy_bypass;
+
+static bool esp32_phy_bypass_resolve_symbol(const char *elf_path,
+                                            const char *symbol,
+                                            uint32_t *addr)
+{
+    g_autofree gchar *contents = NULL;
+    g_autofree gchar *wanted_file = NULL;
+    const char *wanted_symbol = symbol;
+    gsize len = 0;
+
+    const char *colon = strchr(symbol, ':');
+    if (colon) {
+        wanted_file = g_strndup(symbol, colon - symbol);
+        wanted_symbol = colon + 1;
+    }
+
+    if (!g_file_get_contents(elf_path, &contents, &len, NULL)) {
+        return false;
+    }
+    if (len < sizeof(Elf32_Ehdr)) {
+        return false;
+    }
+
+    const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)contents;
+    if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0 ||
+        ehdr->e_ident[EI_CLASS] != ELFCLASS32 ||
+        ehdr->e_ident[EI_DATA] != ELFDATA2LSB ||
+        ehdr->e_machine != EM_XTENSA ||
+        ehdr->e_shentsize != sizeof(Elf32_Shdr) ||
+        ehdr->e_shoff > len ||
+        (uint64_t)ehdr->e_shoff + (uint64_t)ehdr->e_shnum * sizeof(Elf32_Shdr) > len) {
+        return false;
+    }
+
+    const Elf32_Shdr *shdr = (const Elf32_Shdr *)(contents + ehdr->e_shoff);
+    for (int i = 0; i < ehdr->e_shnum; i++) {
+        if (shdr[i].sh_type != SHT_SYMTAB && shdr[i].sh_type != SHT_DYNSYM) {
+            continue;
+        }
+        if (shdr[i].sh_entsize != sizeof(Elf32_Sym) ||
+            shdr[i].sh_link >= ehdr->e_shnum ||
+            shdr[i].sh_offset > len ||
+            shdr[i].sh_size > len - shdr[i].sh_offset) {
+            continue;
+        }
+
+        const Elf32_Shdr *strsec = &shdr[shdr[i].sh_link];
+        if (strsec->sh_offset > len || strsec->sh_size > len - strsec->sh_offset) {
+            continue;
+        }
+
+        const Elf32_Sym *syms = (const Elf32_Sym *)(contents + shdr[i].sh_offset);
+        const char *strtab = contents + strsec->sh_offset;
+        size_t count = shdr[i].sh_size / sizeof(Elf32_Sym);
+        const char *current_file = NULL;
+
+        for (size_t j = 0; j < count; j++) {
+            if (syms[j].st_name >= strsec->sh_size) {
+                continue;
+            }
+            const char *name = strtab + syms[j].st_name;
+            if (ELF32_ST_TYPE(syms[j].st_info) == STT_FILE) {
+                current_file = name;
+                continue;
+            }
+            if (wanted_file && g_strcmp0(current_file, wanted_file) != 0) {
+                continue;
+            }
+            if (strcmp(name, wanted_symbol) == 0 && syms[j].st_value != 0) {
+                *addr = syms[j].st_value;
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static void esp32_phy_bypass_configure(Esp32SocState *ss, const char *elf_path)
+{
+    static const char * const symbols[] = {
+        "esp_phy_load_cal_and_init",
+        "register_chipv7_phy",
+        "esp_restart",
+        "esp_restart_noos",
+        "esp_restart_noos_dig",
+        "i2s_driver_install",
+        "i2s_set_pin",
+        "i2s_zero_dma_buffer",
+        "i2s_stop",
+        "i2s_start",
+        "i2s_write",
+        "_Z11devicesInitv$part$0",
+        "devRGB.cpp:_ZL10initializev",
+        "_Z10WS281Binitv",
+        "_Z12WS281BsetLEDij",
+        "_Z12WS281BsetLEDj",
+    };
+
+    memset(&esp32_phy_bypass, 0, sizeof(esp32_phy_bypass));
+    if (!elf_path || !*elf_path) {
+        return;
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(symbols); i++) {
+        uint32_t addr = 0;
+
+        if (!esp32_phy_bypass_resolve_symbol(elf_path, symbols[i], &addr)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP32: phy-bypass-elf=%s did not contain %s\n",
+                          elf_path, symbols[i]);
+            continue;
+        }
+
+        esp32_phy_bypass.patches[esp32_phy_bypass.patch_count].symbol = symbols[i];
+        esp32_phy_bypass.patches[esp32_phy_bypass.patch_count].addr = addr;
+        esp32_phy_bypass.patches[esp32_phy_bypass.patch_count].return_value =
+            strcmp(symbols[i], "regi2c_ctrl_read_reg_mask") == 0 ? 1 : 0;
+        esp32_phy_bypass.patch_count++;
+    }
+
+    if (esp32_phy_bypass.patch_count == 0) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32: phy-bypass-elf=%s did not contain any known "
+                      "PHY entrypoints; PHY bypass disabled\n",
+                      elf_path);
+        return;
+    }
+
+    esp32_phy_bypass.enabled = true;
+    for (int i = 0; i < ESP32_CPU_COUNT; i++) {
+        esp32_phy_bypass.as[i] = CPU(&ss->cpu[i])->as;
+    }
+    for (uint32_t i = 0; i < esp32_phy_bypass.patch_count; i++) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32: phy bypass armed from %s: %s=0x%08x\n",
+                      elf_path, esp32_phy_bypass.patches[i].symbol,
+                      esp32_phy_bypass.patches[i].addr);
+    }
+}
+
+void esp32_phy_bypass_try_apply(void)
+{
+    static const uint8_t stub_ret0[] = {
+        0x36, 0x41, 0x00,  /* entry a1, 32 */
+        0x0c, 0x02,        /* movi.n a2, 0 */
+        0x1d, 0xf0,        /* retw.n */
+    };
+    static const uint8_t stub_ret1[] = {
+        0x36, 0x41, 0x00,  /* entry a1, 32 */
+        0x0c, 0x12,        /* movi.n a2, 1 */
+        0x1d, 0xf0,        /* retw.n */
+    };
+    uint8_t check[sizeof(stub_ret0)];
+
+    if (!esp32_phy_bypass.enabled) {
+        return;
+    }
+
+    for (uint32_t patch = 0; patch < esp32_phy_bypass.patch_count; patch++) {
+        if (esp32_phy_bypass.patches[patch].patched &&
+            !esp32_phy_bypass.patches[patch].repatchable) {
+            continue;
+        }
+
+        for (int i = 0; i < ESP32_CPU_COUNT; i++) {
+            if (!esp32_phy_bypass.as[i]) {
+                return;
+            }
+        }
+
+        if (address_space_read(esp32_phy_bypass.as[0],
+                               esp32_phy_bypass.patches[patch].addr,
+                               MEMTXATTRS_UNSPECIFIED, check, sizeof(check)) == MEMTX_OK &&
+            memcmp(check,
+                   esp32_phy_bypass.patches[patch].return_value ?
+                       stub_ret1 : stub_ret0,
+                   sizeof(check)) == 0) {
+            continue;
+        }
+
+        const uint8_t *stub = esp32_phy_bypass.patches[patch].return_value ?
+            stub_ret1 : stub_ret0;
+        bool was_patched = esp32_phy_bypass.patches[patch].patched;
+        for (int i = 0; i < ESP32_CPU_COUNT; i++) {
+            address_space_write_rom(esp32_phy_bypass.as[i],
+                                    esp32_phy_bypass.patches[patch].addr,
+                                    MEMTXATTRS_UNSPECIFIED, stub, sizeof(stub_ret0));
+            tb_flush(qemu_get_cpu(i));
+        }
+
+        if (address_space_read(esp32_phy_bypass.as[0],
+                               esp32_phy_bypass.patches[patch].addr,
+                               MEMTXATTRS_UNSPECIFIED, check, sizeof(check)) == MEMTX_OK &&
+            memcmp(check, stub, sizeof(check)) == 0) {
+            esp32_phy_bypass.patches[patch].patched = true;
+            if (!was_patched) {
+                esp32_phy_bypass.patched_count++;
+            }
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP32: %s %s at 0x%08x "
+                          "(returns ESP_OK; firmware image unchanged)\n",
+                          esp32_phy_bypass.patches[patch].symbol,
+                          was_patched ? "re-patched" : "patched",
+                          esp32_phy_bypass.patches[patch].addr);
+        }
+    }
+}
 
 
 static void esp32_machine_init_spi_flash(Esp32SocState *ss, BlockBackend* blk)
@@ -739,19 +1072,229 @@ static void esp32_machine_init_psram(Esp32SocState *ss, uint32_t size_mbytes)
                                 qdev_get_gpio_in_named(psram, SSI_GPIO_CS, 0));
 }
 
-static void esp32_machine_init_i2c(Esp32SocState *s)
+static void esp32_machine_attach_radio(Esp32SocState *ss,
+                                       const char *type_name,
+                                       int spi_index, int cs,
+                                       Chardev *air_chr,
+                                       DeviceState **out_radio)
 {
-    /* It should be possible to create an I2C device from the command line,
-     * however for this to work the I2C bus must be reachable from sysbus-default.
-     * At the moment the peripherals are added to an unrelated bus, to avoid being
-     * reset on CPU reset.
-     * If we find a way to decouple peripheral reset from sysbus reset,
-     * we can move them to the sysbus and thus enable creation of i2c devices.
+    DeviceState *spi_master = DEVICE(&ss->spi[spi_index]);
+    BusState *spi_bus = qdev_get_child_bus(spi_master, "spi");
+
+    DeviceState *radio = qdev_new(type_name);
+    char *id = g_strdup_printf("radio-spi%d-cs%d", spi_index, cs);
+    object_property_add_child(OBJECT(ss), id, OBJECT(radio));
+    g_free(id);
+
+    qdev_prop_set_uint8(radio, "spi_id", spi_index);
+    qdev_prop_set_uint8(radio, "cs", cs);
+    if (air_chr) {
+        qdev_prop_set_chr(radio, "air-chardev", air_chr);
+    }
+
+    qdev_realize_and_unref(radio, spi_bus, &error_fatal);
+    qdev_connect_gpio_out_named(spi_master, SSI_GPIO_CS, cs,
+                                qdev_get_gpio_in_named(radio,
+                                                       SSI_GPIO_CS, 0));
+    if (out_radio) {
+        *out_radio = radio;
+    }
+}
+
+static bool esp32_gpio_pin_valid(int pin)
+{
+    return pin >= 0 && pin < ESP32_GPIO_PIN_COUNT;
+}
+
+static void esp32_machine_connect_radio_dio(Esp32SocState *ss,
+                                            DeviceState *radio,
+                                            const char *gpio_name,
+                                            int dio_index,
+                                            int gpio_pin,
+                                            int chip_index,
+                                            const char *label)
+{
+    if (!esp32_gpio_pin_valid(gpio_pin)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32 radio DIO: chip[%d].%s has no valid gpio "
+                      "(got %d); skipping\n",
+                      chip_index, label, gpio_pin);
+        return;
+    }
+
+    qemu_irq gpio_input = qdev_get_gpio_in_named(DEVICE(&ss->gpio),
+                                                 ESP32_GPIO_IN_GPIO,
+                                                 gpio_pin);
+    qdev_connect_gpio_out_named(radio, gpio_name, dio_index, gpio_input);
+    qemu_set_irq(gpio_input, 0);
+    qemu_log("ESP32 radio DIO: chip[%d].%s -> gpio=%d\n",
+             chip_index, label, gpio_pin);
+}
+
+static void esp32_machine_connect_radio_busy(Esp32SocState *ss,
+                                             DeviceState *radio,
+                                             const char *gpio_name,
+                                             int gpio_pin,
+                                             int chip_index)
+{
+    if (!esp32_gpio_pin_valid(gpio_pin)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32 radio BUSY: chip[%d].busy has no valid gpio "
+                      "(got %d); skipping\n",
+                      chip_index, gpio_pin);
+        return;
+    }
+
+    qemu_irq gpio_input = qdev_get_gpio_in_named(DEVICE(&ss->gpio),
+                                                 ESP32_GPIO_IN_GPIO,
+                                                 gpio_pin);
+    qdev_connect_gpio_out_named(radio, gpio_name, 0, gpio_input);
+    qemu_set_irq(gpio_input, 0);
+    qemu_log("ESP32 radio BUSY: chip[%d].busy -> gpio=%d\n",
+             chip_index, gpio_pin);
+}
+
+static void esp32_machine_connect_radio_signals(Esp32SocState *ss,
+                                                DeviceState *radio,
+                                                EspRadioType type,
+                                                const EspRadioChipConfig *chip,
+                                                int chip_index)
+{
+    switch (type) {
+    case ESP_RADIO_SX127X:
+        esp32_machine_connect_radio_dio(ss, radio, SX127X_DIO_GPIO, 0,
+                                        chip->dio0, chip_index, "dio0");
+        esp32_machine_connect_radio_dio(ss, radio, SX127X_DIO_GPIO, 1,
+                                        chip->dio1, chip_index, "dio1");
+        break;
+    case ESP_RADIO_SX128X:
+        esp32_machine_connect_radio_dio(ss, radio, SX128X_DIO_GPIO, 0,
+                                        chip->dio1, chip_index, "dio1");
+        esp32_machine_connect_radio_busy(ss, radio, SX128X_BUSY_GPIO,
+                                         chip->busy, chip_index);
+        break;
+    case ESP_RADIO_LR1121:
+        esp32_machine_connect_radio_dio(ss, radio, LR1121_DIO_GPIO, 0,
+                                        chip->dio1, chip_index, "dio1");
+        esp32_machine_connect_radio_busy(ss, radio, LR1121_BUSY_GPIO,
+                                         chip->busy, chip_index);
+        break;
+    case ESP_RADIO_NONE:
+        break;
+    }
+}
+
+static void esp32_machine_init_radios(Esp32SocState *ss,
+                                      const EspRadioBoardConfig *cfg,
+                                      const char *air_chardev_name)
+{
+    if (!cfg || cfg->type == ESP_RADIO_NONE) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32: no radio attached — pass -machine "
+                      "esp32,radio-config=<path.json> to wire a radio. "
+                      "SPI/GPIO radio wiring skipped.\n");
+        return;
+    }
+
+    if (cfg->spi_bus != 2 && cfg->spi_bus != 3) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32: radio-config missing/invalid 'radio_spi' "
+                      "(got %d; expected 2 or 3). Radio wiring skipped.\n",
+                      cfg->spi_bus);
+        return;
+    }
+
+    const char *type_name = esp_radio_qdev_type(cfg->type);
+    const char *display_name = esp_radio_type_str(cfg->type);
+
+    Chardev *air_chr = NULL;
+    if (air_chardev_name) {
+        air_chr = qemu_chr_find(air_chardev_name);
+        if (!air_chr) {
+            error_report("Error: chardev '%s' not found for radio-air-chardev",
+                         air_chardev_name);
+        }
+    }
+
+    const int spi_index = cfg->spi_bus;
+    const int chip_count = cfg->chip_count > 0 ? cfg->chip_count : 1;
+
+    qemu_log("ESP32 radio board: type=%s chips=%d spi=%d\n",
+             display_name, chip_count, spi_index);
+
+    for (int i = 0; i < chip_count && i < 2; i++) {
+        DeviceState *radio = NULL;
+        esp32_machine_attach_radio(ss, type_name, spi_index, i,
+                                   (i == 0) ? air_chr : NULL,
+                                   &radio);
+        qemu_log("ESP32 radio chip[%d]: qdev=%s nss=%d dio1=%d "
+                 "busy=%d rst=%d dio0=%d\n",
+                 i, type_name,
+                 cfg->chips[i].nss,
+                 cfg->chips[i].dio1,
+                 cfg->chips[i].busy,
+                 cfg->chips[i].rst,
+                 cfg->chips[i].dio0);
+        esp32_machine_connect_radio_signals(ss, radio, cfg->type,
+                                            &cfg->chips[i], i);
+    }
+
+    for (int i = 0; i < chip_count && i < 2; i++) {
+        int nss = cfg->chips[i].nss;
+        if (nss < 0 || nss >= ESP32_GPIO_PIN_COUNT) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP32 radio NSS: chip[%d] has no valid nss "
+                          "pin (got %d); skipping CS wiring\n",
+                          i, nss);
+            continue;
+        }
+        qdev_connect_gpio_out_named(DEVICE(&ss->gpio),
+                                    ESP32_GPIO_OUT_GPIO, nss,
+                                    qdev_get_gpio_in_named(
+                                        DEVICE(&ss->spi[spi_index]),
+                                        ESP32_SPI_EXTERNAL_CS_GPIO, i));
+        qemu_log("ESP32 radio NSS: gpio=%d -> SPI%d external-cs[%d]\n",
+                 nss, spi_index, i);
+    }
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "ESP32: fake %s attached to SPI%d; "
+                  "NSS/DIO wired from radio-config\n",
+                  display_name, spi_index);
+}
+
+static void esp32_machine_init_i2c(Esp32SocState *s,
+                                   const EspRadioBoardConfig *cfg)
+{
+    /* I2C slaves are described by the radio-config JSON's optional `i2c`
+     * array. When the array is empty (or no config was provided) no slave is
+     * attached — there is no implicit `tmp105` anymore. See
+     * docs/hardware-config.md for the schema.
      */
+    if (!cfg || cfg->i2c_device_count <= 0) {
+        return;
+    }
+
     DeviceState *i2c_master = DEVICE(&s->i2c[0]);
-    I2CBus* i2c_bus = I2C_BUS(qdev_get_child_bus(i2c_master, "i2c"));
-    I2CSlave* tmp105 = i2c_slave_create_simple(i2c_bus, "tmp105", 0x48);
-    object_property_set_int(OBJECT(tmp105), "temperature", 25 * 1000, &error_fatal);
+    I2CBus *i2c_bus = I2C_BUS(qdev_get_child_bus(i2c_master, "i2c"));
+
+    for (int i = 0; i < cfg->i2c_device_count; i++) {
+        const EspI2cDeviceConfig *dev = &cfg->i2c_devices[i];
+        if (dev->address < 0) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP32 i2c[%d]: invalid address; skipping\n", i);
+            continue;
+        }
+        I2CSlave *slave = i2c_slave_create_simple(i2c_bus, dev->type,
+                                                  dev->address);
+        qemu_log("ESP32 i2c: %s @0x%02x\n", dev->type, dev->address);
+
+        if (g_ascii_strcasecmp(dev->type, "tmp105") == 0 &&
+            dev->temperature_milli_c != INT_MIN) {
+            object_property_set_int(OBJECT(slave), "temperature",
+                                    dev->temperature_milli_c, &error_fatal);
+        }
+    }
 }
 
 static void esp32_machine_init_openeth(Esp32SocState *ss)
@@ -791,6 +1334,95 @@ static void esp32_machine_init_sd(Esp32SocState *ss)
     }
 }
 
+static void esp32_machine_gpio_action_cb(void *opaque)
+{
+    Esp32GpioAction *action = opaque;
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "ESP32_GPIO_ACTION: at_ms=%" PRIu64 " gpio=%u level=%d\n",
+                  action->at_ms, action->pin, action->level);
+    qemu_set_irq(action->irq, action->level);
+}
+
+static bool esp32_machine_parse_gpio_action(const char *text,
+                                            uint64_t *at_ms,
+                                            unsigned *pin,
+                                            int *level)
+{
+    char *end = NULL;
+    unsigned long long parsed_at;
+    unsigned long parsed_pin;
+    unsigned long parsed_level;
+
+    parsed_at = strtoull(text, &end, 10);
+    if (end == text || *end != ':') {
+        return false;
+    }
+    text = end + 1;
+
+    parsed_pin = strtoul(text, &end, 10);
+    if (end == text || *end != ':' || parsed_pin >= ESP32_GPIO_PIN_COUNT) {
+        return false;
+    }
+    text = end + 1;
+
+    parsed_level = strtoul(text, &end, 10);
+    if (end == text || *end != '\0' || parsed_level > 1) {
+        return false;
+    }
+
+    *at_ms = parsed_at;
+    *pin = parsed_pin;
+    *level = parsed_level ? 1 : 0;
+    return true;
+}
+
+static void esp32_machine_schedule_gpio_actions(Esp32SocState *ss,
+                                                const char *actions)
+{
+    g_auto(GStrv) items = NULL;
+    int count = 0;
+
+    if (!actions || !*actions) {
+        return;
+    }
+
+    items = g_strsplit(actions, ";", -1);
+    for (char **item = items; item && *item; item++) {
+        uint64_t at_ms = 0;
+        unsigned pin = 0;
+        int level = 0;
+
+        if (!**item) {
+            continue;
+        }
+        if (!esp32_machine_parse_gpio_action(*item, &at_ms, &pin, &level)) {
+            error_report("ESP32 gpio-actions: invalid item '%s' "
+                         "(expected at_ms:pin:level)", *item);
+            continue;
+        }
+
+        Esp32GpioAction *action = g_new0(Esp32GpioAction, 1);
+        action->at_ms = at_ms;
+        action->pin = pin;
+        action->level = level;
+        action->irq = qdev_get_gpio_in_named(DEVICE(&ss->gpio),
+                                             ESP32_GPIO_IN_GPIO, pin);
+        action->timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                     esp32_machine_gpio_action_cb, action);
+        timer_mod(action->timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + at_ms);
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32_GPIO_ACTION: scheduled at_ms=%" PRIu64
+                      " gpio=%u level=%d\n",
+                      at_ms, pin, level);
+        count++;
+    }
+
+    if (count == 0) {
+        error_report("ESP32 gpio-actions: no valid actions scheduled");
+    }
+}
+
 static void esp32_machine_init(MachineState *machine)
 {
     BlockBackend* blk = NULL;
@@ -803,6 +1435,26 @@ static void esp32_machine_init(MachineState *machine)
     }
 
     Esp32MachineState *ms = ESP32_MACHINE(machine);
+    esp_radio_config_log("ESP32", ms->radio_config);
+
+    EspRadioBoardConfig radio_cfg;
+    esp_radio_board_config_init(&radio_cfg);
+    if (ms->radio_config) {
+        Error *err = NULL;
+        if (!esp_radio_board_config_load(ms->radio_config, &radio_cfg, &err)) {
+            error_report_err(err);
+            exit(1);
+        }
+        qemu_log("ESP32 radio board: type=%s chips=%d nss=%d busy=%d "
+                 "dio1=%d miso=%d mosi=%d sck=%d\n",
+                 esp_radio_type_str(radio_cfg.type),
+                 radio_cfg.chip_count,
+                 radio_cfg.chips[0].nss,
+                 radio_cfg.chips[0].busy,
+                 radio_cfg.chips[0].dio1,
+                 radio_cfg.miso, radio_cfg.mosi, radio_cfg.sck);
+    }
+
     object_initialize_child(OBJECT(ms), "soc", &ms->esp32, TYPE_ESP32_SOC);
     Esp32SocState *ss = ESP32_SOC(&ms->esp32);
 
@@ -817,6 +1469,7 @@ static void esp32_machine_init(MachineState *machine)
     }
 
     qdev_realize(DEVICE(ss), NULL, &error_fatal);
+    esp32_phy_bypass_configure(ss, ms->phy_bypass_elf);
 
     if (blk) {
         esp32_machine_init_spi_flash(ss, blk);
@@ -826,11 +1479,15 @@ static void esp32_machine_init(MachineState *machine)
         esp32_machine_init_psram(ss, (uint32_t) (machine->ram_size / MiB));
     }
 
-    esp32_machine_init_i2c(ss);
+    esp32_machine_init_radios(ss, &radio_cfg, ms->radio_air_chardev);
+
+    esp32_machine_init_i2c(ss, &radio_cfg);
 
     esp32_machine_init_openeth(ss);
 
     esp32_machine_init_sd(ss);
+
+    esp32_machine_schedule_gpio_actions(ss, ms->gpio_actions);
 
     /* Need MMU initialized prior to ELF loading,
      * so that ELF gets loaded into virtual addresses
@@ -921,6 +1578,36 @@ static ram_addr_t esp32_fixup_ram_size(ram_addr_t requested_size)
     return size;
 }
 
+ESP_RADIO_OPTIONS_DEFINE_ACCESSORS(esp32_machine, Esp32MachineState, ESP32_MACHINE)
+
+static char *esp32_machine_get_phy_bypass_elf(Object *obj, Error **errp)
+{
+    Esp32MachineState *ms = ESP32_MACHINE(obj);
+    return g_strdup(ms->phy_bypass_elf);
+}
+
+static void esp32_machine_set_phy_bypass_elf(Object *obj, const char *value,
+                                             Error **errp)
+{
+    Esp32MachineState *ms = ESP32_MACHINE(obj);
+    g_free(ms->phy_bypass_elf);
+    ms->phy_bypass_elf = g_strdup(value);
+}
+
+static char *esp32_machine_get_gpio_actions(Object *obj, Error **errp)
+{
+    Esp32MachineState *ms = ESP32_MACHINE(obj);
+    return g_strdup(ms->gpio_actions);
+}
+
+static void esp32_machine_set_gpio_actions(Object *obj, const char *value,
+                                           Error **errp)
+{
+    Esp32MachineState *ms = ESP32_MACHINE(obj);
+    g_free(ms->gpio_actions);
+    ms->gpio_actions = g_strdup(value);
+}
+
 /* Initialize machine type */
 static void esp32_machine_class_init(ObjectClass *oc, void *data)
 {
@@ -931,6 +1618,22 @@ static void esp32_machine_class_init(ObjectClass *oc, void *data)
     mc->default_cpus = 2;
     mc->default_ram_size = 0;
     mc->fixup_ram_size = esp32_fixup_ram_size;
+
+    ESP_RADIO_OPTIONS_ADD_PROPS(oc, esp32_machine);
+    object_class_property_add_str(oc, "phy-bypass-elf",
+                                  esp32_machine_get_phy_bypass_elf,
+                                  esp32_machine_set_phy_bypass_elf);
+    object_class_property_set_description(oc, "phy-bypass-elf",
+        "Developer-side ESP32 ELF used to locate register_chipv7_phy and "
+        "patch that function in runtime memory so QEMU can bypass the "
+        "proprietary Wi-Fi PHY calibration path. The flash image is not "
+        "modified.");
+    object_class_property_add_str(oc, "gpio-actions",
+                                  esp32_machine_get_gpio_actions,
+                                  esp32_machine_set_gpio_actions);
+    object_class_property_set_description(oc, "gpio-actions",
+        "Semicolon-separated ESP32 GPIO input schedule entries in the form "
+        "at_ms:pin:level, for example 3000:0:0;8000:0:1.");
 }
 
 static const TypeInfo esp32_info = {
