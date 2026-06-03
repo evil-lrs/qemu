@@ -55,6 +55,8 @@ typedef struct EspRadioBoardConfig {
 
     bool radio_dcdc;
     bool radio_rfo_hf;
+    int  lr1121_firmware_type;
+    int  lr1121_firmware_version;
     int  rfsw_ctrl[8];
     int  rfsw_ctrl_len;
 

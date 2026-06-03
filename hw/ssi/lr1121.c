@@ -88,6 +88,13 @@
 #define LR1121_OP_WRITE_BUFFER8_SET_TX    0x0704
 #define LR1121_OP_WRITE_BUFFER8_SET_FREQ_SET_TX 0x0705
 
+#define LR1121_OP_BL_ERASE_FLASH          0x8000
+#define LR1121_OP_BL_WRITE_FLASH_ENC      0x8003
+#define LR1121_OP_BL_REBOOT               0x8005
+#define LR1121_OP_BL_GET_PIN              0x800B
+#define LR1121_OP_BL_READ_CHIP_EUI        0x800C
+#define LR1121_OP_BL_READ_JOIN_EUI        0x800D
+
 #define LR1121_OP_SET_GNSS_CONSTELLATION  0x0400
 #define LR1121_OP_SET_GNSS_SCAN_MODE      0x0401
 
@@ -125,6 +132,7 @@
 #define LR1121_STAT2_MODE_RX         0x04
 #define LR1121_STAT2_MODE_TX         0x05
 
+#define LR1121_STAT2_BOOT_BOOTLOADER 0x00
 #define LR1121_STAT2_BOOT_FLASH      0x01
 
 static void lr1121_complete_opcode(LR1121State *s);
@@ -171,9 +179,16 @@ static const char *lr1121_opcode_name(uint16_t op)
     case LR1121_OP_SET_LORA_SYNC_WORD:    return "SetLoRaSyncWord";
     case LR1121_OP_SET_CAD:               return "SetCad";
     case LR1121_OP_SET_CAD_PARAMS:        return "SetCadParams";
+    case LR1121_OP_REBOOT:                return "Reboot";
     case LR1121_OP_SET_FREQ_SET_RX:       return "SetFreqSetRx";
     case LR1121_OP_WRITE_BUFFER8_SET_TX:  return "WriteBuffer8SetTx";
     case LR1121_OP_WRITE_BUFFER8_SET_FREQ_SET_TX: return "WriteBuffer8SetFreqSetTx";
+    case LR1121_OP_BL_ERASE_FLASH:        return "BootloaderEraseFlash";
+    case LR1121_OP_BL_WRITE_FLASH_ENC:    return "BootloaderWriteFlashEncrypted";
+    case LR1121_OP_BL_REBOOT:             return "BootloaderReboot";
+    case LR1121_OP_BL_GET_PIN:            return "BootloaderGetPin";
+    case LR1121_OP_BL_READ_CHIP_EUI:      return "BootloaderReadChipEui";
+    case LR1121_OP_BL_READ_JOIN_EUI:      return "BootloaderReadJoinEui";
     default:                              return NULL;
     }
 }
@@ -204,6 +219,10 @@ static uint16_t lr1121_param_count(uint16_t op)
     case LR1121_OP_SET_TX_CW:
     case LR1121_OP_SET_TX_INFINITE_PREAMBLE:
     case LR1121_OP_GET_LORA_RX_HDR_INFOS:
+    case LR1121_OP_BL_ERASE_FLASH:
+    case LR1121_OP_BL_GET_PIN:
+    case LR1121_OP_BL_READ_CHIP_EUI:
+    case LR1121_OP_BL_READ_JOIN_EUI:
         return 0;
 
     case LR1121_OP_CALIBRATE:
@@ -220,6 +239,7 @@ static uint16_t lr1121_param_count(uint16_t op)
     case LR1121_OP_STOP_TIMEOUT_PREAMBLE:
     case LR1121_OP_SET_LORA_SYNC_TIMEOUT:
     case LR1121_OP_SET_RX_BOOSTED:
+    case LR1121_OP_BL_REBOOT:
         return 1;
 
     case LR1121_OP_SET_TX_PARAMS:
@@ -272,6 +292,7 @@ static uint16_t lr1121_param_count(uint16_t op)
         return 12; /* addr(4), mask(4), data(4) */
 
     case LR1121_OP_WRITE_REG_MEM32:
+    case LR1121_OP_BL_WRITE_FLASH_ENC:
         return 4; /* addr(4), then data until CS deassert */
 
     case LR1121_OP_WRITE_BUFFER8:
@@ -363,6 +384,9 @@ static void lr1121_load_defaults(LR1121State *s)
 
     s->rf_freq_hz = 0;
     s->packet_type = 0;
+    s->bootloader_mode = false;
+    s->bootloader_write_addr = 0;
+    s->bootloader_write_bytes = 0;
     s->tx_payload_len = 0;
     s->rx_payload_len = 0;
     s->rx_start_offset = 0;
@@ -799,6 +823,16 @@ static void lr1121_complete_opcode(LR1121State *s)
             ((uint32_t)s->param_buf[3]);
         break;
 
+    case LR1121_OP_BL_WRITE_FLASH_ENC:
+        s->bootloader_write_addr =
+            ((uint32_t)s->param_buf[0] << 24) |
+            ((uint32_t)s->param_buf[1] << 16) |
+            ((uint32_t)s->param_buf[2] << 8)  |
+            ((uint32_t)s->param_buf[3]);
+        s->mem_addr = 0;
+        lr1121_log_config_event(s, "BootloaderWriteFlashEncrypted");
+        break;
+
     case LR1121_OP_WRITE_REG_MEM_MASK32: {
         uint32_t addr =
             ((uint32_t)s->param_buf[0] << 24) |
@@ -934,7 +968,39 @@ static void lr1121_complete_opcode(LR1121State *s)
         break;
 
     case LR1121_OP_REBOOT:
-        lr1121_load_defaults(s);
+        s->bootloader_mode = s->param_pos > 0 && s->param_buf[0] == 0x03;
+        s->status1 = (LR1121_STAT1_CMD_OK << 1);
+        s->status2 = (LR1121_STAT2_RESET_ANALOG << 4) |
+                     (LR1121_STAT2_MODE_STDBY_RC << 1) |
+                     (s->bootloader_mode ? LR1121_STAT2_BOOT_BOOTLOADER :
+                      LR1121_STAT2_BOOT_FLASH);
+        s->irq_status = 0;
+        s->irq_dio1 = 0;
+        s->irq_dio2 = 0;
+        s->irq_dio3 = 0;
+        s->errors = 0;
+        s->last_read_opcode = 0;
+        lr1121_log_config_event(s, "Reboot");
+        break;
+
+    case LR1121_OP_BL_ERASE_FLASH:
+        s->bootloader_write_bytes = 0;
+        lr1121_log_config_event(s, "BootloaderEraseFlash");
+        break;
+
+    case LR1121_OP_BL_REBOOT:
+        s->bootloader_mode = false;
+        s->status1 = (LR1121_STAT1_CMD_OK << 1);
+        s->status2 = (LR1121_STAT2_RESET_ANALOG << 4) |
+                     (LR1121_STAT2_MODE_STDBY_RC << 1) |
+                     LR1121_STAT2_BOOT_FLASH;
+        s->irq_status = 0;
+        s->irq_dio1 = 0;
+        s->irq_dio2 = 0;
+        s->irq_dio3 = 0;
+        s->errors = 0;
+        s->last_read_opcode = 0;
+        lr1121_log_config_event(s, "BootloaderReboot");
         break;
 
     default:
@@ -968,9 +1034,14 @@ static uint8_t lr1121_response_byte(LR1121State *s)
     case LR1121_OP_GET_VERSION:
         if (i == 0) res = s->status1;
         else if (i == 1) res = 0x01; /* hw */
-        else if (i == 2) res = 0x03; /* transceiver firmware type */
-        else if (i == 3) res = 0x01; /* fw major */
-        else if (i == 4) res = 0x01; /* fw minor */
+        else if (i == 2) res = s->bootloader_mode ? 0xDF : s->firmware_type;
+        else if (i == 3) {
+            uint16_t version = s->bootloader_mode ? 0x0101 : s->firmware_version;
+            res = (version >> 8) & 0xff;
+        } else if (i == 4) {
+            uint16_t version = s->bootloader_mode ? 0x0101 : s->firmware_version;
+            res = version & 0xff;
+        }
         break;
 
     case LR1121_OP_GET_ERRORS:
@@ -1051,11 +1122,22 @@ static uint8_t lr1121_response_byte(LR1121State *s)
         break;
 
     case LR1121_OP_DERIVE_KEYS_PIN:
+    case LR1121_OP_BL_GET_PIN:
         if (i == 0) res = s->status1;
         else if (i == 1) res = 0x12;
         else if (i == 2) res = 0x34;
         else if (i == 3) res = 0x56;
         else if (i == 4) res = 0x78;
+        break;
+
+    case LR1121_OP_BL_READ_CHIP_EUI:
+        if (i == 0) res = s->status1;
+        else if (i >= 1 && i <= 8) res = 0x11 * i;
+        break;
+
+    case LR1121_OP_BL_READ_JOIN_EUI:
+        if (i == 0) res = s->status1;
+        else if (i >= 1 && i <= 8) res = 0x22 * i;
         break;
 
     case LR1121_OP_GET_STATS:
@@ -1162,6 +1244,7 @@ static uint32_t lr1121_transfer(SSIPeripheral *ss, uint32_t tx)
 
             switch (s->opcode) {
             case LR1121_OP_WRITE_REG_MEM32:
+            case LR1121_OP_BL_WRITE_FLASH_ENC:
                 s->phase = LR1121_STATE_MEM_DATA;
                 break;
 
@@ -1194,7 +1277,9 @@ static uint32_t lr1121_transfer(SSIPeripheral *ss, uint32_t tx)
         return lr1121_status_byte_for_index(s, s->response_pos++);
 
     case LR1121_STATE_MEM_DATA:
-        if (s->mem_addr < LR1121_REG_BYTES) {
+        if (s->opcode == LR1121_OP_BL_WRITE_FLASH_ENC) {
+            s->bootloader_write_bytes++;
+        } else if (s->mem_addr < LR1121_REG_BYTES) {
             s->regs[s->mem_addr++] = in;
         }
         return lr1121_status_byte_for_index(s, s->response_pos++);
@@ -1232,6 +1317,8 @@ static void lr1121_reset(DeviceState *dev)
 
 static Property lr1121_properties[] = {
     DEFINE_PROP_UINT8("spi_id", LR1121State, spi_id, 0),
+    DEFINE_PROP_UINT8("firmware-type", LR1121State, firmware_type, 0x03),
+    DEFINE_PROP_UINT16("firmware-version", LR1121State, firmware_version, 0x0104),
     DEFINE_PROP_CHR("air-chardev", LR1121State, air_bus.chr),
     DEFINE_PROP_STRING("radio-id", LR1121State, radio_id),
     DEFINE_PROP_STRING("tx-log", LR1121State, tx_log_path),

@@ -39,6 +39,8 @@ void esp_radio_board_config_init(EspRadioBoardConfig *cfg)
     }
     cfg->radio_dcdc = false;
     cfg->radio_rfo_hf = false;
+    cfg->lr1121_firmware_type = -1;
+    cfg->lr1121_firmware_version = -1;
     cfg->rfsw_ctrl_len = 0;
     for (int i = 0; i < 8; i++) {
         cfg->rfsw_ctrl[i] = 0;
@@ -129,6 +131,24 @@ static bool try_get_bool(const QDict *d, const char *key, bool *out)
         return false;
     }
     *out = qbool_get_bool(b);
+    return true;
+}
+
+static bool try_get_int(const QDict *d, const char *key, int *out)
+{
+    if (!qdict_haskey(d, key)) {
+        return true;
+    }
+    QObject *obj = qdict_get(d, key);
+    QNum *n = qobject_to(QNum, obj);
+    if (!n) {
+        return false;
+    }
+    int64_t v;
+    if (!qnum_get_try_int(n, &v) || v < 0 || v > INT_MAX) {
+        return false;
+    }
+    *out = (int)v;
     return true;
 }
 
@@ -364,6 +384,10 @@ bool esp_radio_board_config_load(const char *path,
 
     ok = ok && try_get_bool(d, "radio_dcdc",   &cfg->radio_dcdc);
     ok = ok && try_get_bool(d, "radio_rfo_hf", &cfg->radio_rfo_hf);
+    ok = ok && try_get_int(d, "lr1121_firmware_type",
+                           &cfg->lr1121_firmware_type);
+    ok = ok && try_get_int(d, "lr1121_firmware_version",
+                           &cfg->lr1121_firmware_version);
 
     if (!ok) {
         error_setg(errp, "radio-config: a radio_* key has the wrong type");

@@ -63,6 +63,11 @@ typedef struct LR1121State {
 
     uint32_t rf_freq_hz;
     uint8_t packet_type;
+    bool bootloader_mode;
+    uint32_t bootloader_write_addr;
+    uint32_t bootloader_write_bytes;
+    uint8_t firmware_type;
+    uint16_t firmware_version;
 
     uint8_t modulation_params[16];
     uint8_t modulation_params_len;
