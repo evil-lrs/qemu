@@ -795,10 +795,19 @@ struct Esp32MachineState {
     char *radio_config;
     char *radio_air_chardev;
     char *phy_bypass_elf;
+    char *gpio_actions;
 };
 #define TYPE_ESP32_MACHINE MACHINE_TYPE_NAME("esp32")
 
 OBJECT_DECLARE_SIMPLE_TYPE(Esp32MachineState, ESP32_MACHINE)
+
+typedef struct Esp32GpioAction {
+    QEMUTimer *timer;
+    qemu_irq irq;
+    uint64_t at_ms;
+    unsigned pin;
+    int level;
+} Esp32GpioAction;
 
 typedef struct Esp32PhyBypassState {
     bool enabled;
@@ -1325,6 +1334,95 @@ static void esp32_machine_init_sd(Esp32SocState *ss)
     }
 }
 
+static void esp32_machine_gpio_action_cb(void *opaque)
+{
+    Esp32GpioAction *action = opaque;
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "ESP32_GPIO_ACTION: at_ms=%" PRIu64 " gpio=%u level=%d\n",
+                  action->at_ms, action->pin, action->level);
+    qemu_set_irq(action->irq, action->level);
+}
+
+static bool esp32_machine_parse_gpio_action(const char *text,
+                                            uint64_t *at_ms,
+                                            unsigned *pin,
+                                            int *level)
+{
+    char *end = NULL;
+    unsigned long long parsed_at;
+    unsigned long parsed_pin;
+    unsigned long parsed_level;
+
+    parsed_at = strtoull(text, &end, 10);
+    if (end == text || *end != ':') {
+        return false;
+    }
+    text = end + 1;
+
+    parsed_pin = strtoul(text, &end, 10);
+    if (end == text || *end != ':' || parsed_pin >= ESP32_GPIO_PIN_COUNT) {
+        return false;
+    }
+    text = end + 1;
+
+    parsed_level = strtoul(text, &end, 10);
+    if (end == text || *end != '\0' || parsed_level > 1) {
+        return false;
+    }
+
+    *at_ms = parsed_at;
+    *pin = parsed_pin;
+    *level = parsed_level ? 1 : 0;
+    return true;
+}
+
+static void esp32_machine_schedule_gpio_actions(Esp32SocState *ss,
+                                                const char *actions)
+{
+    g_auto(GStrv) items = NULL;
+    int count = 0;
+
+    if (!actions || !*actions) {
+        return;
+    }
+
+    items = g_strsplit(actions, ";", -1);
+    for (char **item = items; item && *item; item++) {
+        uint64_t at_ms = 0;
+        unsigned pin = 0;
+        int level = 0;
+
+        if (!**item) {
+            continue;
+        }
+        if (!esp32_machine_parse_gpio_action(*item, &at_ms, &pin, &level)) {
+            error_report("ESP32 gpio-actions: invalid item '%s' "
+                         "(expected at_ms:pin:level)", *item);
+            continue;
+        }
+
+        Esp32GpioAction *action = g_new0(Esp32GpioAction, 1);
+        action->at_ms = at_ms;
+        action->pin = pin;
+        action->level = level;
+        action->irq = qdev_get_gpio_in_named(DEVICE(&ss->gpio),
+                                             ESP32_GPIO_IN_GPIO, pin);
+        action->timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                     esp32_machine_gpio_action_cb, action);
+        timer_mod(action->timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + at_ms);
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32_GPIO_ACTION: scheduled at_ms=%" PRIu64
+                      " gpio=%u level=%d\n",
+                      at_ms, pin, level);
+        count++;
+    }
+
+    if (count == 0) {
+        error_report("ESP32 gpio-actions: no valid actions scheduled");
+    }
+}
+
 static void esp32_machine_init(MachineState *machine)
 {
     BlockBackend* blk = NULL;
@@ -1388,6 +1486,8 @@ static void esp32_machine_init(MachineState *machine)
     esp32_machine_init_openeth(ss);
 
     esp32_machine_init_sd(ss);
+
+    esp32_machine_schedule_gpio_actions(ss, ms->gpio_actions);
 
     /* Need MMU initialized prior to ELF loading,
      * so that ELF gets loaded into virtual addresses
@@ -1494,6 +1594,20 @@ static void esp32_machine_set_phy_bypass_elf(Object *obj, const char *value,
     ms->phy_bypass_elf = g_strdup(value);
 }
 
+static char *esp32_machine_get_gpio_actions(Object *obj, Error **errp)
+{
+    Esp32MachineState *ms = ESP32_MACHINE(obj);
+    return g_strdup(ms->gpio_actions);
+}
+
+static void esp32_machine_set_gpio_actions(Object *obj, const char *value,
+                                           Error **errp)
+{
+    Esp32MachineState *ms = ESP32_MACHINE(obj);
+    g_free(ms->gpio_actions);
+    ms->gpio_actions = g_strdup(value);
+}
+
 /* Initialize machine type */
 static void esp32_machine_class_init(ObjectClass *oc, void *data)
 {
@@ -1514,6 +1628,12 @@ static void esp32_machine_class_init(ObjectClass *oc, void *data)
         "patch that function in runtime memory so QEMU can bypass the "
         "proprietary Wi-Fi PHY calibration path. The flash image is not "
         "modified.");
+    object_class_property_add_str(oc, "gpio-actions",
+                                  esp32_machine_get_gpio_actions,
+                                  esp32_machine_set_gpio_actions);
+    object_class_property_set_description(oc, "gpio-actions",
+        "Semicolon-separated ESP32 GPIO input schedule entries in the form "
+        "at_ms:pin:level, for example 3000:0:0;8000:0:1.");
 }
 
 static const TypeInfo esp32_info = {
