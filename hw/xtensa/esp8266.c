@@ -67,6 +67,7 @@
 #define ESP8266_ROM_ETS_ISR_ATTACH_IMPL 0x40001000
 #define ESP8266_ROM_ETS_ISR_MASK_IMPL 0x40001020
 #define ESP8266_ROM_ETS_ISR_UNMASK_IMPL 0x40001040
+#define ESP8266_ROM_UDIVSI3_ALIAS 0x40001058
 #define ESP8266_ROM_ETS_PRINTF 0x400024cc
 #define ESP8266_ROM_ETS_PUTC 0x40002be8
 #define ESP8266_ROM_ETS_BZERO 0x40002ae8
@@ -148,9 +149,13 @@
 #define ESP8266_FLASH_HELPER_WRITE_ADDR 0x04
 #define ESP8266_FLASH_HELPER_WRITE_SRC 0x08
 #define ESP8266_FLASH_HELPER_WRITE_LEN 0x0c
+#define ESP8266_FLASH_HELPER_READ_ADDR 0x10
+#define ESP8266_FLASH_HELPER_READ_DST 0x14
+#define ESP8266_FLASH_HELPER_READ_LEN 0x18
 #define ESP8266_TRACE_FLASH_HELPER 0
+#define ESP8266_TRACE_PERIPH 0
 #define ESP8266_ETS_SCRATCH_BASE 0x60010000
-#define ESP8266_ETS_SCRATCH_SIZE 0x400
+#define ESP8266_ETS_SCRATCH_SIZE (1 * MiB)
 #define ESP8266_HSPI_CMD 0x00
 #define ESP8266_HSPI_USER1 0x20
 #define ESP8266_HSPI_W0 0x40
@@ -202,7 +207,7 @@
 #define ESP8266_ETS_LOOP_PRIORITY 1
 #define ESP8266_ETS_PUMP_TICK_NS SCALE_MS
 #define ESP8266_LOW_SCRATCH_BASE 0x0
-#define ESP8266_LOW_SCRATCH_SIZE (1 * MiB)
+#define ESP8266_LOW_SCRATCH_SIZE (2 * MiB)
 #define ESP8266_PHY_ROMFUNCS_BASE (ESP8266_LOW_SCRATCH_BASE + 0x100)
 #define ESP8266_PHY_ROMFUNC_NOOP_0 0
 #define ESP8266_PHY_ROMFUNC_I2C_WRITEREG 152
@@ -564,11 +569,19 @@ static const MemoryRegionOps esp8266_gpio_ops = {
 static uint64_t esp8266_spi_read(void *opaque, hwaddr addr, unsigned int size)
 {
     Esp8266SocState *s = opaque;
+    static unsigned trace_count;
 
     if (addr == ESP8266_SPI_STATUS) {
         return 0;
     }
     if (addr < sizeof(s->spi_regs) && (addr % 4) == 0) {
+        if (ESP8266_TRACE_PERIPH && trace_count++ < 2000 &&
+            (addr == ESP8266_SPI_CMD || addr == ESP8266_SPI_ADDR ||
+             addr == ESP8266_SPI_RD_STATUS || addr == ESP8266_SPI_USER1 ||
+             addr == ESP8266_SPI_USER2 || addr >= ESP8266_SPI_W0)) {
+            qemu_log("ESP8266 spi read off=0x%02x size=%u -> 0x%08x\n",
+                     (unsigned)addr, size, s->spi_regs[addr / 4]);
+        }
         return s->spi_regs[addr / 4];
     }
     return 0;
@@ -578,6 +591,7 @@ static void esp8266_spi_write(void *opaque, hwaddr addr, uint64_t value,
                               unsigned int size)
 {
     Esp8266SocState *s = opaque;
+    static unsigned trace_count;
 
     if (addr == ESP8266_SPI_CMD) {
         uint32_t user2 = s->spi_regs[ESP8266_SPI_USER2 / 4];
@@ -585,6 +599,13 @@ static void esp8266_spi_write(void *opaque, hwaddr addr, uint64_t value,
 
         if (flash_op == 0) {
             flash_op = extract32(user2, 24, 8);
+        }
+        if (ESP8266_TRACE_PERIPH && trace_count++ < 5000) {
+            qemu_log("ESP8266 spi cmd value=0x%08" PRIx64
+                     " user1=0x%08x user2=0x%08x op=0x%02x addr=0x%08x w0=0x%08x\n",
+                     value, s->spi_regs[ESP8266_SPI_USER1 / 4],
+                     user2, flash_op, s->spi_regs[ESP8266_SPI_ADDR / 4],
+                     s->spi_regs[ESP8266_SPI_W0 / 4]);
         }
 
         /*
@@ -686,6 +707,12 @@ static void esp8266_spi_write(void *opaque, hwaddr addr, uint64_t value,
         return;
     }
     if (addr < sizeof(s->spi_regs) && (addr % 4) == 0) {
+        if (ESP8266_TRACE_PERIPH && trace_count++ < 5000 &&
+            (addr == ESP8266_SPI_ADDR || addr == ESP8266_SPI_USER1 ||
+             addr == ESP8266_SPI_USER2 || addr >= ESP8266_SPI_W0)) {
+            qemu_log("ESP8266 spi write off=0x%02x size=%u value=0x%08" PRIx64 "\n",
+                     (unsigned)addr, size, value);
+        }
         s->spi_regs[addr / 4] = value;
     }
 }
@@ -758,6 +785,54 @@ static void esp8266_flash_helper_program(Esp8266SocState *s, uint32_t len)
     memcpy(drom + flash_addr, buf, len);
 }
 
+static void esp8266_flash_helper_copy_from_flash(Esp8266SocState *s,
+                                                 uint32_t len)
+{
+    uint32_t flash_addr = s->flash_helper_addr & (ESP8266_FLASH_SIZE - 1);
+    uint32_t dst_addr = s->flash_helper_read_dst;
+    uint8_t *irom = memory_region_get_ram_ptr(&s->irom);
+    uint8_t buf[256];
+
+    if (ESP8266_TRACE_FLASH_HELPER) {
+        qemu_log("ESP8266 flash read addr=0x%06x dst=0x%08x len=%u\n",
+                 flash_addr, dst_addr, len);
+    }
+    if (len > 64 * KiB) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP8266 flash read skipped: addr=0x%06x "
+                      "dst=0x%08x len=%u\n",
+                      flash_addr, dst_addr, len);
+        return;
+    }
+    while (len) {
+        uint32_t chunk = MIN(len, sizeof(buf));
+
+        if (flash_addr + chunk > ESP8266_FLASH_SIZE) {
+            chunk = ESP8266_FLASH_SIZE - flash_addr;
+        }
+        if (chunk == 0) {
+            break;
+        }
+        memcpy(buf, irom + flash_addr, chunk);
+        if (dst_addr < ESP8266_LOW_SCRATCH_SIZE) {
+            uint32_t copied = MIN(chunk, ESP8266_LOW_SCRATCH_SIZE - dst_addr);
+
+            memcpy(s->low_scratch_data + dst_addr, buf, copied);
+            if (copied < chunk) {
+                address_space_write(&address_space_memory, dst_addr + copied,
+                                    MEMTXATTRS_UNSPECIFIED, buf + copied,
+                                    chunk - copied);
+            }
+        } else {
+            address_space_write(&address_space_memory, dst_addr,
+                                MEMTXATTRS_UNSPECIFIED, buf, chunk);
+        }
+        flash_addr = (flash_addr + chunk) & (ESP8266_FLASH_SIZE - 1);
+        dst_addr += chunk;
+        len -= chunk;
+    }
+}
+
 static uint64_t esp8266_flash_helper_read(void *opaque, hwaddr addr,
                                           unsigned int size)
 {
@@ -769,6 +844,10 @@ static void esp8266_flash_helper_write(void *opaque, hwaddr addr,
 {
     Esp8266SocState *s = opaque;
 
+    if (ESP8266_TRACE_FLASH_HELPER) {
+        qemu_log("ESP8266 flash helper write off=0x%02x value=0x%08" PRIx64
+                 " size=%u\n", (unsigned)addr, value, size);
+    }
     switch (addr) {
     case ESP8266_FLASH_HELPER_ERASE_SECTOR:
         esp8266_flash_helper_erase(s, value);
@@ -781,6 +860,15 @@ static void esp8266_flash_helper_write(void *opaque, hwaddr addr,
         break;
     case ESP8266_FLASH_HELPER_WRITE_LEN:
         esp8266_flash_helper_program(s, value);
+        break;
+    case ESP8266_FLASH_HELPER_READ_ADDR:
+        s->flash_helper_addr = value;
+        break;
+    case ESP8266_FLASH_HELPER_READ_DST:
+        s->flash_helper_read_dst = value;
+        break;
+    case ESP8266_FLASH_HELPER_READ_LEN:
+        esp8266_flash_helper_copy_from_flash(s, value);
         break;
     default:
         break;
@@ -840,15 +928,24 @@ static const MemoryRegionOps esp8266_i2c_ops = {
 static uint64_t esp8266_timer_read(void *opaque, hwaddr addr, unsigned int size)
 {
     Esp8266SocState *s = opaque;
+    static unsigned trace_count;
 
     if (addr == 0 || addr == ESP8266_TIMER_COUNT ||
         addr == ESP8266_TIMER_FRC1_COUNT) {
         static uint64_t timer_us;
 
         timer_us += ESP8266_TIME_STEP_US;
+        if (ESP8266_TRACE_PERIPH && trace_count++ < 1000) {
+            qemu_log("ESP8266 timer read off=0x%02x size=%u -> 0x%08" PRIx64 "\n",
+                     (unsigned)addr, size, timer_us);
+        }
         return timer_us;
     }
     if (addr == ESP8266_TIMER_STATUS) {
+        if (ESP8266_TRACE_PERIPH && trace_count++ < 1000) {
+            qemu_log("ESP8266 timer read status -> 0x%08x\n",
+                     s->timer_regs[addr / 4] | ESP8266_TIMER_STATUS_READY);
+        }
         return s->timer_regs[addr / 4] | ESP8266_TIMER_STATUS_READY;
     }
     if (addr < sizeof(s->timer_regs) && (addr % 4) == 0) {
@@ -861,7 +958,12 @@ static void esp8266_timer_write(void *opaque, hwaddr addr, uint64_t value,
                                 unsigned int size)
 {
     Esp8266SocState *s = opaque;
+    static unsigned trace_count;
 
+    if (ESP8266_TRACE_PERIPH && trace_count++ < 1000) {
+        qemu_log("ESP8266 timer write off=0x%02x value=0x%08" PRIx64
+                 " size=%u\n", (unsigned)addr, value, size);
+    }
     if (addr == ESP8266_TIMER_FRC1_INT) {
         s->timer_regs[ESP8266_TIMER_FRC1_CTRL / 4] &=
             ~ESP8266_TIMER_FRC1_CTRL_INT_STATUS;
@@ -952,8 +1054,13 @@ static const MemoryRegionOps esp8266_iomux_ops = {
 static uint64_t esp8266_sys_read(void *opaque, hwaddr addr, unsigned int size)
 {
     Esp8266SocState *s = opaque;
+    static unsigned trace_count;
 
     if (addr < sizeof(s->sys_regs) && (addr % 4) == 0) {
+        if (ESP8266_TRACE_PERIPH && trace_count++ < 1000) {
+            qemu_log("ESP8266 sys read off=0x%02x size=%u -> 0x%08x\n",
+                     (unsigned)addr, size, s->sys_regs[addr / 4]);
+        }
         return s->sys_regs[addr / 4];
     }
     return 0;
@@ -963,8 +1070,13 @@ static void esp8266_sys_write(void *opaque, hwaddr addr, uint64_t value,
                               unsigned int size)
 {
     Esp8266SocState *s = opaque;
+    static unsigned trace_count;
 
     if (addr < sizeof(s->sys_regs) && (addr % 4) == 0) {
+        if (ESP8266_TRACE_PERIPH && trace_count++ < 1000) {
+            qemu_log("ESP8266 sys write off=0x%02x value=0x%08" PRIx64
+                     " size=%u\n", (unsigned)addr, value, size);
+        }
         s->sys_regs[addr / 4] = value;
     }
 }
@@ -1380,7 +1492,7 @@ static void esp8266_init_rom_stubs(Esp8266SocState *s)
         0x06, 0x1b, 0x00,       /* j base + 0x80 */
     };
     static const uint8_t ets_memmove_jump[] = {
-        0x06, 0x17, 0x00,       /* j base + 0x80 */
+        0x06, 0x37, 0x00,       /* j base + 0x100 */
     };
     static const uint8_t ets_memcmp_jump[] = {
         0x06, 0x1f, 0x00,       /* j base + 0xb0 */
@@ -1405,6 +1517,31 @@ static void esp8266_init_rom_stubs(Esp8266SocState *s)
         0x56, 0x04, 0xff,       /* bnez a4, loop */
         0x0d, 0xf0,             /* done: ret.n */
     };
+    static const uint8_t ets_memmove_impl[] = {
+        0x5d, 0x02,             /* mov.n a5, a2 */
+        0xac, 0xe4,             /* beqz.n a4, done */
+        0x37, 0x32, 0x1a,       /* bltu a2, a3, forward */
+        0x4a, 0x63,             /* add.n a6, a3, a4 */
+        0x67, 0xb2, 0x15,       /* bgeu a2, a6, forward */
+        0x4a, 0x52,             /* add.n a5, a2, a4 */
+        0x4a, 0x33,             /* add.n a3, a3, a4 */
+        0x0b, 0x55,             /* backward: addi.n a5, a5, -1 */
+        0x0b, 0x33,             /* addi.n a3, a3, -1 */
+        0x62, 0x03, 0x00,       /* l8ui a6, a3, 0 */
+        0x62, 0x45, 0x00,       /* s8i a6, a5, 0 */
+        0x0b, 0x44,             /* addi.n a4, a4, -1 */
+        0x56, 0x04, 0xff,       /* bnez a4, backward */
+        0x0d, 0xf0,             /* ret.n */
+        0x00,                   /* align forward target */
+        0x5d, 0x02,             /* forward: mov.n a5, a2 */
+        0x62, 0x03, 0x00,       /* loop: l8ui a6, a3, 0 */
+        0x62, 0x45, 0x00,       /* s8i a6, a5, 0 */
+        0x1b, 0x55,             /* addi.n a5, a5, 1 */
+        0x1b, 0x33,             /* addi.n a3, a3, 1 */
+        0x42, 0xc4, 0xff,       /* addi a4, a4, -1 */
+        0x56, 0xf4, 0xfe,       /* bnez a4, loop */
+        0x0d, 0xf0,             /* done: ret.n */
+    };
     static const uint8_t ets_memcmp_impl[] = {
         0x9c, 0x04,             /* beqz.n a4, equal */
         0x52, 0x02, 0x00,       /* loop: l8ui a5, a2, 0 */
@@ -1424,20 +1561,11 @@ static void esp8266_init_rom_stubs(Esp8266SocState *s)
         0x0d, 0xf0,             /* ret.n */
     };
     static const uint8_t spi_read[] = {
-        0x00, 0x00, 0x20, 0x40, /* literal: mapped flash base */
+        0x00, 0x14, 0x00, 0x60, /* literal: flash helper base */
         0x51, 0xff, 0xff,       /* l32r a5, . - 4 */
-        0x57, 0x32, 0x06,       /* bltu a2, a5, add_base */
-        0x5d, 0x02,             /* mov.n a5, a2 */
-        0xc6, 0x00, 0x00,       /* j loop_test */
-        0x00, 0x00,             /* padding */
-        0x2a, 0x55,             /* add_base: add.n a5, a5, a2 */
-        0x8c, 0xd4,             /* loop_test: beqz.n a4, done */
-        0x62, 0x05, 0x00,       /* l8ui a6, a5, 0 */
-        0x62, 0x43, 0x00,       /* s8i a6, a3, 0 */
-        0x1b, 0x55,             /* addi.n a5, a5, 1 */
-        0x1b, 0x33,             /* addi.n a3, a3, 1 */
-        0x0b, 0x44,             /* addi.n a4, a4, -1 */
-        0x56, 0x04, 0xff,       /* bnez a4, loop */
+        0x29, 0x45,             /* s32i.n a2, a5, 16 */
+        0x39, 0x55,             /* s32i.n a3, a5, 20 */
+        0x49, 0x65,             /* s32i.n a4, a5, 24 */
         0x0c, 0x02,             /* movi.n a2, 0 */
         0x0d, 0xf0,             /* ret.n */
     };
@@ -1458,18 +1586,15 @@ static void esp8266_init_rom_stubs(Esp8266SocState *s)
         0x0d, 0xf0,             /* ret.n */
     };
     static const uint8_t udivsi3[] = {
-        0x16, 0x13, 0x05, 0x37, 0xb2, 0x09, 0x42, 0xa3,
-        0xe8, 0x47, 0x93, 0x03, 0x0c, 0x12, 0x0d, 0xf0,
-        0x0b, 0x53, 0x50, 0x63, 0x10, 0xdc, 0x56, 0x0c,
-        0x04, 0x26, 0x13, 0x07, 0x30, 0x31, 0x41, 0x1b,
-        0x44, 0x06, 0xfd, 0xff, 0x00, 0x04, 0x40, 0x20,
-        0x20, 0x91, 0x0d, 0xf0, 0x00, 0x00, 0x0c, 0x04,
-        0x0c, 0x05, 0x62, 0xa0, 0x20, 0x20, 0x7f, 0x05,
-        0xf0, 0x55, 0x11, 0x70, 0x55, 0x20, 0xf0, 0x22,
-        0x11, 0xf0, 0x44, 0x11, 0x37, 0x35, 0x04, 0x30,
-        0x55, 0xc0, 0x1b, 0x44, 0x0b, 0x66, 0x56, 0x36,
-        0xfe, 0x2d, 0x04, 0x0d, 0xf0, 0x0c, 0x02, 0x0d,
-        0xf0,
+        0x0c, 0x04,             /* movi.n a4, 0 */
+        0x8c, 0xa3,             /* beqz.n a3, done */
+        0x37, 0x32, 0x08,       /* loop: bltu a2, a3, done */
+        0x30, 0x22, 0xc0,       /* sub a2, a2, a3 */
+        0x1b, 0x44,             /* addi.n a4, a4, 1 */
+        0x06, 0xfd, 0xff,       /* j loop */
+        0x00,                   /* align done target */
+        0x2d, 0x04,             /* done: mov.n a2, a4 */
+        0x0d, 0xf0,             /* ret.n */
     };
     static const uint8_t udivdi3[] = {
         0x56, 0x63, 0x05, 0x56, 0x35, 0x05, 0x16, 0x04,
@@ -1500,6 +1625,17 @@ static void esp8266_init_rom_stubs(Esp8266SocState *s)
         0x20, 0xf0, 0x22, 0x11, 0x37, 0x35, 0x02, 0x30,
         0x55, 0xc0, 0x0b, 0x66, 0x56, 0x86, 0xfe, 0x2d,
         0x05, 0x0d, 0xf0, 0x00, 0x0c, 0x02, 0x0d, 0xf0,
+    };
+    static const uint8_t udivsi3_alias[] = {
+        0x0c, 0x04,             /* movi.n a4, 0 */
+        0x8c, 0xa3,             /* beqz.n a3, done */
+        0x37, 0x32, 0x08,       /* loop: bltu a2, a3, done */
+        0x30, 0x22, 0xc0,       /* sub a2, a2, a3 */
+        0x1b, 0x44,             /* addi.n a4, a4, 1 */
+        0x06, 0xfd, 0xff,       /* j loop */
+        0x00,                   /* align done target */
+        0x2d, 0x04,             /* done: mov.n a2, a4 */
+        0x0d, 0xf0,             /* ret.n */
     };
     static const uint8_t umulsidi3[] = {
         0x12, 0xc1, 0xf0, 0xc9, 0x01, 0xd9, 0x11, 0x20,
@@ -1602,6 +1738,8 @@ static void esp8266_init_rom_stubs(Esp8266SocState *s)
            ets_memcpy_impl, sizeof(ets_memcpy_impl));
     memcpy(rom + ESP8266_ROM_ETS_MEMSET - ESP8266_ROM_BASE + 0xb0,
            ets_memcmp_impl, sizeof(ets_memcmp_impl));
+    memcpy(rom + ESP8266_ROM_ETS_MEMSET - ESP8266_ROM_BASE + 0x100,
+           ets_memmove_impl, sizeof(ets_memmove_impl));
     memcpy(rom + ESP8266_ROM_SPI_READ_STATUS - ESP8266_ROM_BASE,
            zero_result, sizeof(zero_result));
     memcpy(rom + ESP8266_ROM_SPI_WRITE_STATUS - ESP8266_ROM_BASE,
@@ -1628,6 +1766,8 @@ static void esp8266_init_rom_stubs(Esp8266SocState *s)
            zero_result, sizeof(zero_result));
     memcpy(rom + ESP8266_ROM_UDIVSI3 - ESP8266_ROM_BASE,
            udivsi3, sizeof(udivsi3));
+    memcpy(rom + ESP8266_ROM_UDIVSI3_ALIAS - ESP8266_ROM_BASE,
+           udivsi3_alias, sizeof(udivsi3_alias));
     memcpy(rom + ESP8266_ROM_UDIVDI3 - ESP8266_ROM_BASE,
            udivdi3, sizeof(udivdi3));
     memcpy(rom + ESP8266_ROM_UMODDI3 - ESP8266_ROM_BASE,
@@ -1647,7 +1787,7 @@ static void esp8266_init_rom_stubs(Esp8266SocState *s)
     memcpy(rom + ESP8266_ROM_MEMCPY - ESP8266_ROM_BASE,
            guarded_memcpy, sizeof(guarded_memcpy));
     memcpy(rom + ESP8266_ROM_MEMMOVE - ESP8266_ROM_BASE,
-           guarded_memcpy, sizeof(guarded_memcpy));
+           ets_memmove_impl, sizeof(ets_memmove_impl));
     memcpy(rom + ESP8266_ROM_MEMSET - ESP8266_ROM_BASE,
            guarded_memset, sizeof(guarded_memset));
     memcpy(rom + ESP8266_ROM_STRLEN - ESP8266_ROM_BASE, ets_strlen,
@@ -1770,7 +1910,7 @@ static void esp8266_soc_realize(DeviceState *dev, Error **errp)
 
     memory_region_init_io(&s->flash_helper, OBJECT(dev),
                           &esp8266_flash_helper_ops, s,
-                          "esp8266.flash-helper", 0x10);
+                          "esp8266.flash-helper", 0x20);
     memory_region_add_subregion(system_memory, ESP8266_FLASH_HELPER_BASE,
                                 &s->flash_helper);
 

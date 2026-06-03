@@ -57,6 +57,7 @@ typedef struct Esp8266SocState {
     uint8_t spi_flash_status2;
     uint32_t flash_helper_addr;
     uint32_t flash_helper_src;
+    uint32_t flash_helper_read_dst;
     uint32_t gpio_regs[ESP8266_GPIO_MMIO_WORDS];
     uint32_t spi_regs[ESP8266_SPI_MMIO_WORDS];
     uint32_t i2c_regs[ESP8266_I2C_MMIO_WORDS];
@@ -67,8 +68,8 @@ typedef struct Esp8266SocState {
     uint32_t hspi_regs[ESP8266_HSPI_MMIO_WORDS];
     uint32_t sys_regs[ESP8266_SYS_MMIO_WORDS];
     uint64_t sdk_time_guard_us;
-    uint8_t low_scratch_data[0x100000];
-    uint8_t ets_scratch_data[0x400];
+    uint8_t low_scratch_data[0x200000];
+    uint8_t ets_scratch_data[0x100000];
     uint32_t boot_entry;
     bool boot_loaded;
 } Esp8266SocState;
