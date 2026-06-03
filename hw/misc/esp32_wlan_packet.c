@@ -35,11 +35,10 @@
 #include "esp32_wlan.h"
 #include "esp32_wlan_packet.h"
 
-// the frame checksum isn't used so just put zero in there.
 void insertCRC(mac80211_frame *frame) {
-    unsigned long crc;
+    uint32_t crc = 0;
     unsigned char *fcs = (unsigned char *)frame;
-    crc = 0;
+
     memcpy(fcs+frame->frame_length, &crc, 4);
     frame->frame_length += 4;
 }
@@ -89,6 +88,8 @@ static mac80211_frame *new_frame(unsigned type, unsigned subtype) {
     frame->duration_id = 314;
     frame->sequence_control.fragment_number = 0;
     frame->pos=0;
+    frame->frame_length = IEEE80211_HEADER_SIZE;
+    frame->signal_strength = -30;
     return frame;
 }
 
@@ -188,6 +189,21 @@ mac80211_frame *Esp32_WLAN_create_association_request(access_point_info *ap) {
     add_data(frame,4,(uint8_t []){0x21,4,3,0});
     add_ssid(frame,ap->ssid);
     add_rates(frame);
+    return frame;
+}
+
+mac80211_frame *Esp32_WLAN_create_association_request_wpa2_psk(access_point_info *ap) {
+    mac80211_frame *frame = Esp32_WLAN_create_association_request(ap);
+    uint8_t rsn[] = {
+        0x01, 0x00,                         /* RSN version */
+        0x00, 0x0f, 0xac, 0x04,             /* group cipher: CCMP */
+        0x01, 0x00,                         /* pairwise cipher count */
+        0x00, 0x0f, 0xac, 0x04,             /* pairwise cipher: CCMP */
+        0x01, 0x00,                         /* AKM count */
+        0x00, 0x0f, 0xac, 0x02,             /* AKM: PSK */
+        0x00, 0x00                          /* RSN capabilities */
+    };
+    add_tag(frame, 48, sizeof(rsn), rsn);
     return frame;
 }
 

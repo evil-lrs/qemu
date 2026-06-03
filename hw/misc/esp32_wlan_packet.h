@@ -45,6 +45,7 @@ struct mac80211_frame *Esp32_WLAN_create_authentication_request(void);
 struct mac80211_frame *Esp32_WLAN_create_authentication_response(access_point_info *ap);
 struct mac80211_frame *Esp32_WLAN_create_deauthentication(void);
 struct mac80211_frame *Esp32_WLAN_create_association_request(access_point_info *ap);
+struct mac80211_frame *Esp32_WLAN_create_association_request_wpa2_psk(access_point_info *ap);
 struct mac80211_frame *Esp32_WLAN_create_association_response(access_point_info *ap);
 struct mac80211_frame *Esp32_WLAN_create_disassociation(void);
 struct mac80211_frame *Esp32_WLAN_create_data_reply(Esp32WifiState *s, struct mac80211_frame *incoming);

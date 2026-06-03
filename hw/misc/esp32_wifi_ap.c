@@ -32,6 +32,7 @@
 
 #include "qemu/osdep.h"
 #include "net/net.h"
+#include "qemu/log.h"
 #include "qemu/timer.h"
 
 #include "hw/irq.h"
@@ -48,6 +49,108 @@
 #define ENABLE_BEACON 1
 #define DEBUG_DUMPFRAMES 0
 #define DEBUG_WIRESHARK_IMPORT 0
+#define ETHERTYPE_QEMU_RAW_80211 0x88f0
+
+static const uint8_t softap_station_mac[6] = {
+    0x10, 0x01, 0x00, 0xc4, 0x0a, 0x55
+};
+
+static const char *wlan_type_name(unsigned type)
+{
+    switch (type) {
+    case IEEE80211_TYPE_MGT:
+        return "MGT";
+    case IEEE80211_TYPE_CTL:
+        return "CTL";
+    case IEEE80211_TYPE_DATA:
+        return "DATA";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static const char *wlan_mgt_subtype_name(unsigned subtype)
+{
+    switch (subtype) {
+    case IEEE80211_TYPE_MGT_SUBTYPE_BEACON:
+        return "BEACON";
+    case IEEE80211_TYPE_MGT_SUBTYPE_ACTION:
+        return "ACTION";
+    case IEEE80211_TYPE_MGT_SUBTYPE_PROBE_REQ:
+        return "PROBE_REQ";
+    case IEEE80211_TYPE_MGT_SUBTYPE_PROBE_RESP:
+        return "PROBE_RESP";
+    case IEEE80211_TYPE_MGT_SUBTYPE_AUTHENTICATION:
+        return "AUTH";
+    case IEEE80211_TYPE_MGT_SUBTYPE_DEAUTHENTICATION:
+        return "DEAUTH";
+    case IEEE80211_TYPE_MGT_SUBTYPE_ASSOCIATION_REQ:
+        return "ASSOC_REQ";
+    case IEEE80211_TYPE_MGT_SUBTYPE_ASSOCIATION_RESP:
+        return "ASSOC_RESP";
+    case IEEE80211_TYPE_MGT_SUBTYPE_DISASSOCIATION:
+        return "DISASSOC";
+    default:
+        return "MGT_OTHER";
+    }
+}
+
+static const char *wlan_subtype_name(unsigned type, unsigned subtype)
+{
+    if (type == IEEE80211_TYPE_MGT) {
+        return wlan_mgt_subtype_name(subtype);
+    }
+    if (type == IEEE80211_TYPE_CTL && subtype == IEEE80211_TYPE_CTL_SUBTYPE_ACK) {
+        return "ACK";
+    }
+    if (type == IEEE80211_TYPE_DATA && subtype == IEEE80211_TYPE_DATA_SUBTYPE_DATA) {
+        return "DATA";
+    }
+    return "OTHER";
+}
+
+static void wlan_log_frame(const char *dir, Esp32WifiState *s,
+                           const struct mac80211_frame *frame)
+{
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "ESP32_WIFI_FRAME dir=%s type=%s subtype=%s channel=%d "
+                  "mode=%u ap_state=%u flags=0x%x "
+                  "addr1=%02x:%02x:%02x:%02x:%02x:%02x "
+                  "addr2=%02x:%02x:%02x:%02x:%02x:%02x "
+                  "addr3=%02x:%02x:%02x:%02x:%02x:%02x len=%u\n",
+                  dir,
+                  wlan_type_name(frame->frame_control.type),
+                  wlan_subtype_name(frame->frame_control.type,
+                                    frame->frame_control.sub_type),
+                  esp32_wifi_channel,
+                  s->mode,
+                  s->ap_state,
+                  frame->frame_control.flags,
+                  frame->destination_address[0], frame->destination_address[1],
+                  frame->destination_address[2], frame->destination_address[3],
+                  frame->destination_address[4], frame->destination_address[5],
+                  frame->source_address[0], frame->source_address[1],
+                  frame->source_address[2], frame->source_address[3],
+                  frame->source_address[4], frame->source_address[5],
+                  frame->bssid_address[0], frame->bssid_address[1],
+                  frame->bssid_address[2], frame->bssid_address[3],
+                  frame->bssid_address[4], frame->bssid_address[5],
+                  frame->frame_length);
+}
+
+static void wlan_log_eth(const char *dir, const uint8_t *buf, size_t size)
+{
+    if (size < 14) {
+        return;
+    }
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "ESP32_WIFI_ETH dir=%s dst=%02x:%02x:%02x:%02x:%02x:%02x "
+                  "src=%02x:%02x:%02x:%02x:%02x:%02x type=0x%02x%02x len=%zu\n",
+                  dir,
+                  buf[0], buf[1], buf[2], buf[3], buf[4], buf[5],
+                  buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+                  buf[12], buf[13], size);
+}
 
 // color defines
 #define BLACK 0
@@ -372,8 +475,42 @@ static ssize_t Esp32_WLAN_receive(NetClientState *ncs,
      * access points turns it into a 802.11 frame and
      * forwards it to the wireless device
      */
+    if (size >= 38 &&
+        buf[12] == ((ETHERTYPE_QEMU_RAW_80211 >> 8) & 0xff) &&
+        buf[13] == (ETHERTYPE_QEMU_RAW_80211 & 0xff)) {
+        frame = g_malloc0(sizeof(*frame));
+        size_t raw_size = size - 14;
+        if (raw_size > IEEE80211_HEADER_SIZE + sizeof(frame->data_and_fcs)) {
+            raw_size = sizeof(frame->data_and_fcs) + IEEE80211_HEADER_SIZE;
+        }
+        memcpy(frame, buf + 14, raw_size);
+        frame->frame_length = raw_size;
+        frame->signal_strength = -30;
+        frame->next_frame = NULL;
+        wlan_log_frame("raw80211-to-guest", s, frame);
+        Esp32_WLAN_insert_frame(s, frame);
+        return size;
+    }
+
     frame = Esp32_WLAN_create_data_packet(s, buf, size);
     if (frame) {
+        wlan_log_eth("netdev-to-guest", buf, size);
+        if (size >= 34 && buf[12] == 0x08 && buf[13] == 0x00) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP32_WIFI_IPV4 dir=netdev-to-guest proto=%u "
+                          "src=%u.%u.%u.%u dst=%u.%u.%u.%u len=%zu\n",
+                          buf[23],
+                          buf[26], buf[27], buf[28], buf[29],
+                          buf[30], buf[31], buf[32], buf[33],
+                          size);
+        }
+        if (size >= 42 && buf[12] == 0x08 && buf[13] == 0x06) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP32_WIFI_ARP dir=netdev-to-guest op=%u target=%u.%u.%u.%u len=%zu\n",
+                          ((unsigned)buf[20] << 8) | buf[21],
+                          buf[38], buf[39], buf[40], buf[41],
+                          size);
+        }
         if(s->mode == Esp32_Mode_Station){
              memcpy(s->ap_macaddr,s->associated_ap_macaddr,6);
         
@@ -389,10 +526,6 @@ static ssize_t Esp32_WLAN_receive(NetClientState *ncs,
             memcpy(frame->destination_address, s->softap_macaddr,6);
             if(s->ap_state==Esp32_WLAN__STATE_STA_ASSOCIATED) {
                 frame->frame_control.flags=1;
-                // if it's an arp request put the correct reply mac address in the packet 
-                if( frame->data_and_fcs[6]==8 && frame->data_and_fcs[7]==6) {
-                    memcpy(frame->data_and_fcs+16,s->ap_macaddr,6);
-                }
             }
         }
 
@@ -499,6 +632,16 @@ static ssize_t Esp32_WLAN_receive(NetClientState *ncs,
           return size; 
         }
         Esp32_WLAN_init_ap_frame(s, frame);
+        if (s->mode == Esp32_Mode_SoftAP) {
+            memcpy(frame->destination_address, s->softap_macaddr, 6);
+            memcpy(frame->source_address, &buf[6], 6);
+            memcpy(frame->bssid_address, &buf[0], 6);
+            if (s->softap_privacy && size >= 14 &&
+                !(buf[12] == 0x88 && buf[13] == 0x8e)) {
+                frame->frame_control.flags |= 0x40;
+            }
+        }
+        wlan_log_frame("netdev-to-guest", s, frame);
         Esp32_WLAN_insert_frame(s, frame);
     }
     return size;
@@ -518,6 +661,7 @@ void Esp32_WLAN_reset_ap(Esp32WifiState *s) {
     s->ap_state = Esp32_WLAN__STATE_NOT_AUTHENTICATED;
     s->beacon_ap=0;
     s->mode = Esp32_Mode_Station;
+    s->softap_privacy = 0;
     memcpy(s->ap_macaddr,(uint8_t[]){0x10,0x13,0x46,0xbf,0x31,0x50},sizeof(s->ap_macaddr));
 
     s->inject_timer_running = 0;
@@ -567,6 +711,7 @@ void Esp32_WLAN_handle_frame(Esp32WifiState *s, struct mac80211_frame *frame)
     struct mac80211_frame *reply = NULL;
     static access_point_info dummy_ap={0};
     static char ssid[64];
+    static bool softap_requires_rsn;
     unsigned long ethernet_frame_size;
     unsigned char ethernet_frame[1518];
 
@@ -582,6 +727,7 @@ void Esp32_WLAN_handle_frame(Esp32WifiState *s, struct mac80211_frame *frame)
     if((ENABLE_BEACON)||!((frame->frame_control.type == IEEE80211_TYPE_MGT)&&(frame->frame_control.sub_type == IEEE80211_TYPE_MGT_SUBTYPE_BEACON))){
         infoprint(frame);
     }
+    wlan_log_frame("guest-to-wlan", s, frame);
     access_point_info *ap_info=0;
 
     if(s->mode == Esp32_Mode_Station){
@@ -596,16 +742,25 @@ void Esp32_WLAN_handle_frame(Esp32WifiState *s, struct mac80211_frame *frame)
     if(frame->frame_control.type == IEEE80211_TYPE_MGT) {        
         switch(frame->frame_control.sub_type) {
             case IEEE80211_TYPE_MGT_SUBTYPE_BEACON:
-                if(s->ap_state==Esp32_WLAN__STATE_NOT_AUTHENTICATED || s->ap_state==Esp32_WLAN__STATE_AUTHENTICATED) {
+                if(s->ap_state==Esp32_WLAN__STATE_NOT_AUTHENTICATED ||
+                   s->ap_state==Esp32_WLAN__STATE_AUTHENTICATED ||
+                   s->ap_state==Esp32_WLAN__STATE_STA_NOT_AUTHENTICATED) {
                     strncpy(ssid,(char *)frame->data_and_fcs+14,frame->data_and_fcs[13]);
                     if(DEBUG) printf("beacon from %s\n",ssid);
                     dummy_ap.ssid=ssid;
                     dummy_ap.channel = esp32_wifi_channel;
                     dummy_ap.sigstrength= -23;
+                    softap_requires_rsn = (frame->beacon_info.capability & 0x10) != 0;
+                    s->softap_privacy = softap_requires_rsn ? 1 : 0;
+                    memcpy(s->ap_macaddr, softap_station_mac,
+                           sizeof(s->ap_macaddr));
                     memcpy(dummy_ap.mac_address,s->ap_macaddr,6) ;
                     memcpy(s->softap_macaddr,frame->bssid_address,6);
                     s->mode = Esp32_Mode_SoftAP;
                     s->ap_state=Esp32_WLAN__STATE_STA_NOT_AUTHENTICATED;
+                    qemu_log_mask(LOG_GUEST_ERROR,
+                                  "ESP32_WIFI_STATE mode=SoftAP ap_state=%u ssid=%s\n",
+                                  s->ap_state, ssid);
                     send_single_frame(s,frame,Esp32_WLAN_create_probe_request(&dummy_ap));
                 }
                 break;
@@ -653,22 +808,40 @@ void Esp32_WLAN_handle_frame(Esp32WifiState *s, struct mac80211_frame *frame)
                 strncpy(ssid,(char *)frame->data_and_fcs+14,frame->data_and_fcs[13]);
                 if(DEBUG) printf("probe resp from %s\n",ssid);
                 dummy_ap.ssid=ssid;
+                softap_requires_rsn = (frame->beacon_info.capability & 0x10) != 0;
+                s->softap_privacy = softap_requires_rsn ? 1 : 0;
                 s->ap_state=Esp32_WLAN__STATE_STA_NOT_AUTHENTICATED;
                 send_single_frame(s,frame,Esp32_WLAN_create_deauthentication());
                 send_single_frame(s,frame,Esp32_WLAN_create_authentication_request());
                 break;
             case IEEE80211_TYPE_MGT_SUBTYPE_ASSOCIATION_RESP:
                 if(DEBUG) printf("assoc resp\n");
+                if (s->mode == Esp32_Mode_SoftAP) {
+                    memcpy(s->associated_ap_macaddr, s->macaddr,
+                           sizeof(s->associated_ap_macaddr));
+                    s->ap_state = Esp32_WLAN__STATE_STA_ASSOCIATED;
+                    qemu_log_mask(LOG_GUEST_ERROR,
+                                  "ESP32_WIFI_STATE mode=SoftAP ap_state=STA_ASSOCIATED "
+                                  "client_ip=10.0.0.2 dhcp=skipped\n");
+                    break;
+                }
                 mac80211_frame *frame1=Esp32_WLAN_create_dhcp_discover(s);
                 memcpy(frame1->bssid_address,BROADCAST,6);
                 memcpy(frame1->source_address,frame->destination_address,6);
                 memcpy(frame1->destination_address,frame->source_address,6);
                 send_single_frame(s,0,frame1);
                 s->ap_state=Esp32_WLAN__STATE_STA_DHCP;
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "ESP32_WIFI_STATE mode=SoftAP ap_state=STA_DHCP\n");
                 break;
             case IEEE80211_TYPE_MGT_SUBTYPE_DISASSOCIATION:
                 DEBUG_PRINT_AP(("Received disassociation!\n"));
                 send_single_frame(s,frame,Esp32_WLAN_create_disassociation());
+                if (s->mode == Esp32_Mode_SoftAP) {
+                    s->ap_state = Esp32_WLAN__STATE_STA_NOT_AUTHENTICATED;
+                    qemu_log_mask(LOG_GUEST_ERROR,
+                                  "ESP32_WIFI_STATE mode=SoftAP ap_state=STA_NOT_AUTHENTICATED reason=disassoc\n");
+                }
                 if (s->ap_state == Esp32_WLAN__STATE_ASSOCIATED || s->ap_state == Esp32_WLAN__STATE_STA_ASSOCIATED) {
                     s->ap_state = Esp32_WLAN__STATE_AUTHENTICATED;
                 }
@@ -676,6 +849,11 @@ void Esp32_WLAN_handle_frame(Esp32WifiState *s, struct mac80211_frame *frame)
             case IEEE80211_TYPE_MGT_SUBTYPE_DEAUTHENTICATION:
                 DEBUG_PRINT_AP(("Received deauthentication!\n"));
                 //reply = Esp32_WLAN_create_authentication_response(ap_info);
+                if (s->mode == Esp32_Mode_SoftAP) {
+                    s->ap_state = Esp32_WLAN__STATE_STA_NOT_AUTHENTICATED;
+                    qemu_log_mask(LOG_GUEST_ERROR,
+                                  "ESP32_WIFI_STATE mode=SoftAP ap_state=STA_NOT_AUTHENTICATED reason=deauth\n");
+                }
                 if (s->ap_state == Esp32_WLAN__STATE_AUTHENTICATED) {
                     s->ap_state = Esp32_WLAN__STATE_NOT_AUTHENTICATED;
                 }
@@ -683,7 +861,13 @@ void Esp32_WLAN_handle_frame(Esp32WifiState *s, struct mac80211_frame *frame)
             case IEEE80211_TYPE_MGT_SUBTYPE_AUTHENTICATION:
                 DEBUG_PRINT_AP(("Received authentication!\n"));
                 if(frame->data_and_fcs[2]==2) { // response
-                    send_single_frame(s,frame,Esp32_WLAN_create_association_request(&dummy_ap));
+                    if (softap_requires_rsn) {
+                        send_single_frame(s, frame,
+                            Esp32_WLAN_create_association_request_wpa2_psk(&dummy_ap));
+                    } else {
+                        send_single_frame(s, frame,
+                            Esp32_WLAN_create_association_request(&dummy_ap));
+                    }
                 }
                 break;
         }
@@ -735,9 +919,30 @@ void Esp32_WLAN_handle_frame(Esp32WifiState *s, struct mac80211_frame *frame)
                 //memcpy(s->associated_ap_macaddr,s->ap_macaddr,sizeof(s->ap_macaddr));
                 memcpy(s->associated_ap_macaddr,s->macaddr,sizeof(s->macaddr));
                 s->ap_state=Esp32_WLAN__STATE_STA_ASSOCIATED; 
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "ESP32_WIFI_STATE mode=SoftAP ap_state=STA_ASSOCIATED "
+                              "client_ip=%u.%u.%u.%u\n",
+                              req->dhcp.yiaddr[0], req->dhcp.yiaddr[1],
+                              req->dhcp.yiaddr[2], req->dhcp.yiaddr[3]);
                 if(DEBUG) printf("Dhcp received addr %d.%d.%d.%d\n",req->dhcp.yiaddr[0],req->dhcp.yiaddr[1],req->dhcp.yiaddr[2],req->dhcp.yiaddr[3]);
             }
         } else if (s->ap_state == Esp32_WLAN__STATE_ASSOCIATED || s->ap_state == Esp32_WLAN__STATE_STA_ASSOCIATED) {
+            if (s->mode == Esp32_Mode_SoftAP &&
+                (frame->frame_control.flags & 0x40)) {
+                ethernet_frame[12] = (ETHERTYPE_QEMU_RAW_80211 >> 8) & 0xff;
+                ethernet_frame[13] = ETHERTYPE_QEMU_RAW_80211 & 0xff;
+                memcpy(&ethernet_frame[0], frame->destination_address, 6);
+                memcpy(&ethernet_frame[6], frame->source_address, 6);
+                ethernet_frame_size = frame->frame_length;
+                if (ethernet_frame_size > sizeof(ethernet_frame) - 14) {
+                    ethernet_frame_size = sizeof(ethernet_frame) - 14;
+                }
+                memcpy(&ethernet_frame[14], frame, ethernet_frame_size);
+                ethernet_frame_size += 14;
+                qemu_send_packet(qemu_get_queue(s->nic), ethernet_frame, ethernet_frame_size);
+                wlan_log_eth("guest-to-netdev-raw80211", ethernet_frame, ethernet_frame_size);
+                goto delivered;
+            }
             /*
             * The access point uses the 802.11 frame
             * and sends a 802.3 frame into the network...
@@ -753,7 +958,10 @@ void Esp32_WLAN_handle_frame(Esp32WifiState *s, struct mac80211_frame *frame)
 
             // the new originator of the packet is
             // the access point
-            if(s->ap_state == Esp32_WLAN__STATE_ASSOCIATED)
+            if (s->mode == Esp32_Mode_SoftAP) {
+                memcpy(&ethernet_frame[6], frame->source_address, 6);
+            }
+            else if(s->ap_state == Esp32_WLAN__STATE_ASSOCIATED)
                 memcpy(&ethernet_frame[6], s->ap_macaddr, 6);
             else
                 memcpy(&ethernet_frame[6], s->macaddr, 6);
@@ -782,8 +990,9 @@ void Esp32_WLAN_handle_frame(Esp32WifiState *s, struct mac80211_frame *frame)
             * Send 802.3 frame
             */
             qemu_send_packet(qemu_get_queue(s->nic), ethernet_frame, ethernet_frame_size);
+            wlan_log_eth("guest-to-netdev", ethernet_frame, ethernet_frame_size);
         }
     }
+delivered:
     Esp32_WLAN_frame_delivered(s);
 }
-

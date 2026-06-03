@@ -98,7 +98,14 @@ static int match_mac_address(uint8_t *a1,uint8_t *a2) {
 }
 // frame from ap to esp32
 void Esp32_sendFrame(Esp32WifiState *s, mac80211_frame *frame,int length, int signal_strength) {
-    if(s->dma_inlink_address==0) return;
+    if(s->dma_inlink_address==0) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ESP32_WIFI_RX drop=no-dma-inlink frame_type=%u subtype=%u len=%d\n",
+                      frame->frame_control.type,
+                      frame->frame_control.sub_type,
+                      length);
+        return;
+    }
     uint8_t *header=malloc(sizeof(wifi_pkt_rx_ctrl_t)+length);
     memset(header,0,sizeof(wifi_pkt_rx_ctrl_t)+length);
     wifi_pkt_rx_ctrl_t *pkt=(wifi_pkt_rx_ctrl_t *)header;
@@ -129,6 +136,13 @@ void Esp32_sendFrame(Esp32WifiState *s, mac80211_frame *frame,int length, int si
     // do a DMA transfer from the hardware to esp32 memory
     dma_list_item item;
     address_space_read(&address_space_memory, s->dma_inlink_address, MEMTXATTRS_UNSPECIFIED, &item, 12);
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "ESP32_WIFI_RX dma_inlink=0x%08x item_addr=0x%08x item_len=%u frame_len=%d total_len=%d\n",
+                  s->dma_inlink_address,
+                  item.address,
+                  item.length,
+                  frame->frame_length,
+                  length);
     address_space_write(&address_space_memory, item.address, MEMTXATTRS_UNSPECIFIED, header, length);
     item.length=length;
     item.eof=1;

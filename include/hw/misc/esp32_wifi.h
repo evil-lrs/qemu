@@ -54,6 +54,7 @@ typedef struct Esp32WifiState {
     uint8_t softap_macaddr[6];       
 
     uint8_t mode;  
+    uint8_t softap_privacy;
 
 } Esp32WifiState;
 
